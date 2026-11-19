@@ -42,21 +42,25 @@ this PR): the only clean copy of the user's configuration was an automatic pre-m
 
 ## Recommendations (not implemented here; ordered by value for effort)
 
-1. **Pin a last-known-good copy.** When pruning, always keep the newest backup whose `app_config`
-   has `setup_complete = 1` and a non-empty credential, in addition to the newest N. A read-only
-   open of each candidate at prune time is enough. This alone closes finding 1 and 3.
+1. **Docs (free, do first).** In `docs/troubleshooting.md`, tell users to copy the backup they are
+   restoring from to a safe place before the next start, since that start may take a new backup and
+   count against the limit (finding 1).
 2. **Snapshot the config on change, not only on migration.** Write a small JSON or SQLite export of
    `app_config` (the credentials and paths users must re-enter by hand) to a rotating
    `<db>.config-snapshots/` folder whenever the config is saved, keeping the last ~10 distinct
-   versions. This covers finding 2 and is tiny.
+   versions. This is the one that covers finding 2 directly, is tiny, and does not depend on
+   judging which database copy is good.
 3. **Detect config regression at startup.** If `app_config` has more than one row, or `setup_complete`
    went from 1 to 0 since the last recorded start, log a loud warning and take a backup before
    continuing. Covers finding 4 and gives a trigger for finding 2.
-4. **Raise `BACKUP_KEEP` modestly (5) only if 1 is not adopted.** More slots delay finding 1 but do
+4. **Pin a last-known-good backup, as a heuristic.** When pruning, also keep the newest backup whose
+   `app_config` has `setup_complete = 1` and a non-empty credential. This is a heuristic, not proof
+   of a good copy: a newer, damaged database can satisfy both tests and displace the genuinely good
+   one. It narrows finding 1 and 3 but does not close them, so prefer an explicit pin (a marker the
+   user or a successful config save sets, which only another explicit action replaces) if this is
+   built, and treat 2 as the primary protection.
+5. **Raise `BACKUP_KEEP` modestly (5) only if 4 is not adopted.** More slots delay finding 1 but do
    not fix it.
-5. **Docs.** In `docs/troubleshooting.md`, tell users to copy the backup they are restoring from to
-   a safe place before the next start, since that start may take a new backup and count against the
-   limit.
 
-Each of 1 to 3 is small enough for its own PR and would need tests in
+Each of 2 to 4 is small enough for its own PR and would need tests in
 `backend/tests/unit/test_database_backup.py`.

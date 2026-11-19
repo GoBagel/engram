@@ -4,17 +4,22 @@
 # ``app.config`` reads DATABASE_URL and ``app.database`` builds its engine at import. The
 # default is the relative ``./engram.db``, i.e. the developer's REAL database when pytest
 # runs from backend/. Point it at a throwaway file first, unconditionally (an ambient
-# DATABASE_URL from a developer's shell is overridden too). app/db_guard.py then refuses
-# to run at all if anything still resolves outside the temp dir. Regression tests:
-# tests/unit/test_db_isolation.py.
+# DATABASE_URL from a developer's shell is overridden too), register that directory as the
+# only place a test may keep SQLite files, and guard sqlite3.connect itself. app/db_guard.py
+# then refuses to run at all if anything resolves outside the registered directories.
+# Regression tests: tests/unit/test_db_isolation.py.
 import atexit
 import os
 import shutil
 import tempfile
 from pathlib import Path
 
+from app import db_guard  # light: imports nothing else from the app
+
 _TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="engram-pytest-db-")).resolve()
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TEST_DB_DIR / 'engram-test.db'}"
+db_guard.allow_test_root(_TEST_DB_DIR)
+db_guard.install_sqlite_guard()
 atexit.register(shutil.rmtree, _TEST_DB_DIR, ignore_errors=True)
 # ---------------------------------------------------------------------------------------
 
@@ -27,20 +32,22 @@ def pytest_sessionstart(session):
     """Prove isolation before the first test runs; abort the whole session if it fails."""
     from app.config import settings
     from app.database import engine
-    from app.db_guard import is_isolated_database_url
 
-    problems = []
-    if not is_isolated_database_url(settings.database_url):
-        problems.append(f"settings.database_url = {settings.database_url!r}")
-    if not is_isolated_database_url(str(engine.url)):
-        problems.append(f"app.database.engine.url = {str(engine.url)!r}")
+    problems = db_guard.session_isolation_problems(
+        **{"settings.database_url": settings.database_url, "engine.url": str(engine.url)}
+    )
     if problems:
         pytest.exit(
-            "Refusing to run: tests would touch a database outside temp storage ("
-            + "; ".join(problems)
-            + "). Your real engram.db was not opened.",
+            "Refusing to run: tests would touch a database outside the registered test "
+            "directories (" + "; ".join(problems) + ").",
             returncode=3,
         )
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _register_pytest_basetemp(tmp_path_factory):
+    """Let tests keep SQLite files under pytest's own basetemp, and nowhere else."""
+    db_guard.allow_test_root(tmp_path_factory.getbasetemp())
 
 
 @pytest.fixture(autouse=True)

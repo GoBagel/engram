@@ -9,7 +9,7 @@ Engram is a disc ripping and media organization tool with a reactive web dashboa
 ## Important Rules
 
 - **NEVER delete `backend/engram.db`** unless the user explicitly asks. It contains API keys and credentials that must be re-entered manually.
-- **Tests must never touch a real database.** `uv run pytest` from `backend/` used to open `backend/engram.db` (the default `./engram.db` is cwd-relative) and, via the integration suite, replace a configured `app_config` row with fixture rows and delete job history. `tests/conftest.py` now forces `DATABASE_URL` to a throwaway temp file *before* the app is imported, and `app/db_guard.py` fails closed (raises `ProductionDatabaseAccessError`) if anything under pytest resolves to a non-temp, non-in-memory database. Never add a fixture, env override, or `settings.database_url` patch that points at `./engram.db`, `~/.engram/`, or any real path; never weaken `tests/conftest.py` or the guard to make a test pass. Regression tests: `backend/tests/unit/test_db_isolation.py`.
+- **Tests must never touch a real database.** `uv run pytest` from `backend/` used to open `backend/engram.db` (the default `./engram.db` is cwd-relative) and, via the integration suite, replace a configured `app_config` row with fixture rows and delete job history. `tests/conftest.py` now forces `DATABASE_URL` to a throwaway file in a fresh directory *before* the app is imported and registers that directory (plus pytest's basetemp) as the only place a test may keep SQLite files. `app/db_guard.py` fails closed (raises `ProductionDatabaseAccessError`): while `pytest` is imported it wraps `sqlite3.connect`, so any opener (engines, the backup helper, caches, scripts) is refused before a file exists unless it is in-memory or inside a registered directory, and `ATTACH` is disabled. The system temp dir as a whole is deliberately not trusted. Residual limits are listed in the `app/db_guard.py` docstring. Never add a fixture, env override, or `settings.database_url` patch that points at `./engram.db`, `~/.engram/`, or any real path; never weaken `tests/conftest.py` or the guard to make a test pass. Regression tests: `backend/tests/unit/test_db_isolation.py`.
 - **Always terminate this session's servers when work is done — and before opening a PR.** Kill the `uvicorn`/`python` (uvicorn workers) and `makemkvcon` processes you started; orphans cause duplicate jobs and MakeMKV drive conflicts. If you're the only running session, killing them all is fine; if other sessions are live, scope the kill to **your own ports** so you don't take down a sibling (see "Parallel sessions / worktree isolation"). Never use `--reload` — it spawns a child process with its own drive sentinel, creating duplicate disc events.
 
 ## Repository Organization
@@ -593,17 +593,20 @@ async def setup_db():
 
 **Database isolation (read before writing any test that touches the DB)**:
 - That pattern is only safe because `tests/conftest.py` points `DATABASE_URL` at a throwaway
-  file under the system temp dir before `app` is imported, so the app's "real" `async_session`
-  is the test database. In a different process or rootdir (no `tests/conftest.py`), the same
-  code would run `DELETE` against whatever `DATABASE_URL` resolves to, so `app/db_guard.py`
-  refuses to start under pytest unless the database is in-memory or inside the temp dir.
+  file in a directory it created, and registers that directory, before `app` is imported, so the
+  app's "real" `async_session` is the test database. In a different process or rootdir (no
+  `tests/conftest.py`), the same code would run `DELETE` against whatever `DATABASE_URL` resolves
+  to, so `app/db_guard.py` refuses to start under pytest, and refuses any `sqlite3.connect`,
+  unless the target is in-memory or inside a registered test directory.
 - Every `DELETE FROM app_config` / `drop_all` / `DELETE FROM disc_jobs` in a test is fine
   only for that reason. Do not copy it into a script, a one-off harness, or a pytest run
   started from a custom rootdir. A script that needs a database sets its own scratch
   `DATABASE_URL` (see `docs/development/subtitle-cache.md`).
-- To verify isolation without running the suite: `uv run pytest tests/unit/test_db_isolation.py`.
-  Before running *any* test command in a checkout whose `backend/engram.db` matters, confirm
-  that file's modification time did not change afterwards.
+- To check isolation before the first run, without running any test, from `backend/`:
+  `DATABASE_URL=sqlite+aiosqlite:///./engram.db uv run python -c "import pytest, app.config"`
+  must fail with `ProductionDatabaseAccessError` (it opens nothing: the refusal is at import).
+  `uv run pytest tests/unit/test_db_isolation.py` then runs only the isolation tests. In a checkout
+  whose `backend/engram.db` matters, hash it before and after a run and confirm it is unchanged.
 
 **Key patterns**:
 - Use the app's `async_session` (it is the isolated test database, see above); unit tests also patch it onto an in-memory engine

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.db_guard import enforce_test_database_isolation
+from app.db_guard import enforce_test_database_isolation, install_sqlite_guard
 
 
 def is_frozen() -> bool:
@@ -91,5 +91,8 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # Fail closed: under pytest, refuse to continue if the database is anything but
-# in-memory or inside the temp dir (tests/conftest.py arranges the latter).
+# in-memory or inside a directory the test run registered (tests/conftest.py arranges
+# that), and guard sqlite3.connect itself so no other opener can reach a real database
+# either. Both are no-ops unless pytest is imported (see app/db_guard.py).
 enforce_test_database_isolation(settings.database_url)
+install_sqlite_guard()
