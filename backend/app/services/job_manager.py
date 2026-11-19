@@ -395,6 +395,11 @@ class JobManager:
         await self._cleanup_stale_jobs()
         await self._restore_discdb_mappings()
         await self._recover_organizing_jobs()
+        # Settle any completed-movie correction a crash left half-done. Runs
+        # before the drive monitor so nothing else races it; files only, no drive.
+        from app.services.movie_identity_service import reconcile_pending
+
+        await reconcile_pending()
 
         self._drive_monitor.set_async_callback(
             self._on_drive_event,
