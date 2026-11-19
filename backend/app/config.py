@@ -13,6 +13,8 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.db_guard import enforce_test_database_isolation
+
 
 def is_frozen() -> bool:
     """True for packaged (PyInstaller) builds.
@@ -87,3 +89,7 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# Fail closed: under pytest, refuse to continue if the database is anything but
+# in-memory or inside the temp dir (tests/conftest.py arranges the latter).
+enforce_test_database_isolation(settings.database_url)

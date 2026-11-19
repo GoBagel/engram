@@ -15,6 +15,7 @@ from sqlmodel import SQLModel
 from app import __version__
 from app.config import settings
 from app.database_backup import backup_before_migrate, mark_startup_complete
+from app.db_guard import enforce_connection_isolation, enforce_test_database_isolation
 
 # Import all models so their tables are registered with SQLModel.metadata
 from app.models import AppConfig, DiscJob, MovieIdentityOperation  # noqa: F401
@@ -53,6 +54,9 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     polite queueing rather than errors. Module-level (not a decorator closure) so
     it can be unit-tested against a throwaway connection.
     """
+    # Before any pragma that can write: under pytest, refuse a connection bound to
+    # anything but an in-memory or temp-dir database (see app/db_guard.py).
+    enforce_connection_isolation(dbapi_connection)
     cursor = dbapi_connection.cursor()
     try:
         cursor.execute("PRAGMA journal_mode=WAL")
@@ -77,6 +81,8 @@ async_session = sessionmaker(
 
 async def init_db() -> None:
     """Initialize the database, creating all tables and running migrations."""
+    # Re-checked here, not just at import: a test may have replaced the setting.
+    enforce_test_database_isolation(settings.database_url)
     # Copy the file before anything below can change it (#730). Never raises.
     await asyncio.to_thread(
         backup_before_migrate,

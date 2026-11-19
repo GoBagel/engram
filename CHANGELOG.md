@@ -8,6 +8,10 @@ All notable changes to Engram will be documented in this file.
 
 - **Change Movie on completed movie jobs.** A movie that was filed under the wrong TMDB title (a `TITAN` disc filed as *Titan (2021)* instead of *Titan A.E. (2000)*) can now be corrected from its History detail without re-ripping. Search TMDB or enter a movie ID, review exactly which files will move (main feature and extras), and confirm. Nothing is overwritten: a destination that already exists, a folder shared with another job, a symlink, or a file outside your movies library blocks the correction with a reason. Every correction is journaled before any file moves, rolled back if it fails, finished or undone on the next start if Engram is interrupted, and kept as an audit entry with the previous identity. Contributions already sent to the fingerprint network or TheDiscDB are not changed.
 
+### Fixed
+
+- **The backend test suite can no longer touch your real database.** Running `pytest` from `backend/` opened `backend/engram.db` (the default `./engram.db` is relative to the working directory), and the integration tests wrote fixture rows into it, replaced the configured `app_config` row (the setup wizard reappeared and credentials were lost) and deleted job history. Tests now run against a throwaway temp database, and Engram refuses to run under pytest against anything that is not in-memory or in the temp directory. This affects contributors only: a packaged or served Engram is unchanged.
+
 ## [0.45.2] - 2026-11-18
 
 _Highlights: discs identified by TheDiscDB get each episode on the right track again, complete Blu-ray rips are no longer mistaken for truncated ones, AI matching works with LM Studio and Ollama, German shows matched in German go to review far less often, and the TheTVDB numbering suggestion can be accepted on a disc with no known season._

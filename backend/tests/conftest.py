@@ -1,8 +1,46 @@
 """Core pytest fixtures for UMA subtitle workflow tests."""
 
-from unittest.mock import Mock
+# --- Database isolation: MUST stay above every ``app`` import -------------------------
+# ``app.config`` reads DATABASE_URL and ``app.database`` builds its engine at import. The
+# default is the relative ``./engram.db``, i.e. the developer's REAL database when pytest
+# runs from backend/. Point it at a throwaway file first, unconditionally (an ambient
+# DATABASE_URL from a developer's shell is overridden too). app/db_guard.py then refuses
+# to run at all if anything still resolves outside the temp dir. Regression tests:
+# tests/unit/test_db_isolation.py.
+import atexit
+import os
+import shutil
+import tempfile
+from pathlib import Path
 
-import pytest
+_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="engram-pytest-db-")).resolve()
+os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TEST_DB_DIR / 'engram-test.db'}"
+atexit.register(shutil.rmtree, _TEST_DB_DIR, ignore_errors=True)
+# ---------------------------------------------------------------------------------------
+
+from unittest.mock import Mock  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+def pytest_sessionstart(session):
+    """Prove isolation before the first test runs; abort the whole session if it fails."""
+    from app.config import settings
+    from app.database import engine
+    from app.db_guard import is_isolated_database_url
+
+    problems = []
+    if not is_isolated_database_url(settings.database_url):
+        problems.append(f"settings.database_url = {settings.database_url!r}")
+    if not is_isolated_database_url(str(engine.url)):
+        problems.append(f"app.database.engine.url = {str(engine.url)!r}")
+    if problems:
+        pytest.exit(
+            "Refusing to run: tests would touch a database outside temp storage ("
+            + "; ".join(problems)
+            + "). Your real engram.db was not opened.",
+            returncode=3,
+        )
 
 
 @pytest.fixture(autouse=True)

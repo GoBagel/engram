@@ -78,13 +78,32 @@ async def client():
 
 @pytest.fixture(autouse=True)
 async def setup_db():
-    """Clean database between tests."""
+    """Clean the TEST database between tests (see "Database isolation" below)."""
     await init_db()
     async with async_session() as session:
         await session.execute(text("DELETE FROM disc_titles"))
         await session.execute(text("DELETE FROM disc_jobs"))
         await session.commit()
 ```
+
+#### Database isolation
+
+The fixture above runs `DELETE` statements against whatever `DATABASE_URL` resolves to, and the
+default is the working-directory-relative `./engram.db`: your real database when you run pytest
+from `backend/`. Two layers make that safe:
+
+1. `tests/conftest.py` sets `DATABASE_URL` to a throwaway file in the system temp directory,
+   unconditionally, before anything imports `app` (an exported `DATABASE_URL` in your shell is
+   overridden too). The file is deleted when the session ends.
+2. `app/db_guard.py` fails closed. While pytest is imported, `app.config`, `init_db()`, the sync
+   engine factory and every new SQLite connection refuse (with `ProductionDatabaseAccessError`) any
+   database that is not in-memory or inside the temp directory. Production never imports pytest,
+   so the guard does nothing there.
+
+If a pytest run aborts with that error, something bypassed `tests/conftest.py` (a custom
+`--rootdir`, a script that imports `app` under pytest, or a test that replaced
+`settings.database_url`). Fix the test; do not loosen the guard. The regression tests are in
+`backend/tests/unit/test_db_isolation.py`.
 
 ### Frontend E2E
 
