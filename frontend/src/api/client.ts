@@ -560,3 +560,69 @@ export async function amendTitle(
     body: JSON.stringify({ target }),
   });
 }
+
+// ---------------------------------------------------------------------------
+// Completed-movie re-identification (spec 2026-11-18)
+// ---------------------------------------------------------------------------
+
+export interface MovieIdentityMove {
+  title_id: number;
+  role: "main" | "extra";
+  src: string;
+  dst: string;
+}
+
+export interface MovieIdentitySnapshot {
+  tmdb_id: number | null;
+  title: string | null;
+  year: number | null;
+  final_path: string | null;
+  classification_source?: string;
+  classification_confidence?: number;
+}
+
+/** Read-only dry run of a correction. `token` must be echoed back to apply it. */
+export interface MovieIdentityPreview {
+  job_id: number;
+  ok: boolean;
+  previous: MovieIdentitySnapshot;
+  proposed: MovieIdentitySnapshot;
+  moves: MovieIdentityMove[];
+  blockers: string[];
+  warnings: string[];
+  token: string;
+}
+
+/** The human-readable `detail` of a FastAPI error, falling back to the raw message. */
+export function errorDetail(e: unknown): string {
+  if (e instanceof ApiError) {
+    try {
+      const parsed = JSON.parse(e.body) as { detail?: unknown };
+      if (typeof parsed.detail === "string") return parsed.detail;
+    } catch {
+      // body was not JSON
+    }
+  }
+  return e instanceof Error ? e.message : "Request failed";
+}
+
+export async function previewMovieIdentity(
+  jobId: number,
+  tmdbId: number,
+): Promise<MovieIdentityPreview> {
+  return apiFetch<MovieIdentityPreview>(
+    `/api/jobs/${jobId}/movie-identity/preview?tmdb_id=${tmdbId}`,
+  );
+}
+
+export async function changeMovieIdentity(
+  jobId: number,
+  tmdbId: number,
+  token: string,
+): Promise<{ status: string; operation_id: string }> {
+  return apiFetch(`/api/jobs/${jobId}/movie-identity/change`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tmdb_id: tmdbId, token, confirm: true }),
+  });
+}

@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { motion, AnimatePresence } from "motion/react";
 import { apiFetch, amendTitle } from "../api/client";
 import { AmendTitleModal } from "./HistoryPage/AmendTitleModal";
+import { ChangeMovieModal } from "./HistoryPage/ChangeMovieModal";
 import { amendEpisodeOptions } from "./HistoryPage/amendEpisodes";
 import { useSeasonRoster } from "../hooks/useSeasonRoster";
 import { FailedJobRecovery } from "./HistoryPage/FailedJobRecovery";
@@ -411,6 +412,7 @@ function JobDetailPanel({
   onRefreshDetail: () => void;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
+  const [changeMovieOpen, setChangeMovieOpen] = useState(false);
   const [amendTarget, setAmendTarget] = useState<{ titleId: number; titleIndex: number; matchedEpisode: string | null } | null>(null);
 
   // Close on click outside or Escape key
@@ -636,6 +638,27 @@ function JobDetailPanel({
                           : `ID ${detail.tmdb_id}`
                       }
                     />
+                  )}
+                  {detail.state === "completed" && detail.content_type === "movie" && (
+                    <button
+                      type="button"
+                      onClick={() => setChangeMovieOpen(true)}
+                      style={{
+                        alignSelf: "flex-start",
+                        padding: "6px 10px",
+                        fontFamily: sv.mono,
+                        fontSize: 10,
+                        fontWeight: 700,
+                        letterSpacing: "0.14em",
+                        textTransform: "uppercase",
+                        color: sv.cyan,
+                        border: `1px solid ${sv.cyan}`,
+                        background: "transparent",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Change movie
+                    </button>
                   )}
                   {detail.is_ambiguous_movie && (
                     <span style={{ fontFamily: sv.mono, fontSize: 10, color: sv.amber }}>
@@ -902,6 +925,19 @@ function JobDetailPanel({
           </div>
         </div>
       ) : null}
+
+      {detail && changeMovieOpen && (
+        <ChangeMovieModal
+          jobId={detail.id}
+          currentTitle={detail.tmdb_name ?? detail.detected_title}
+          currentYear={detail.tmdb_year ?? null}
+          currentSource={detail.classification_source}
+          currentConfidence={detail.classification_confidence}
+          currentPath={detail.final_path ?? null}
+          onApplied={onRefreshDetail}
+          onClose={() => setChangeMovieOpen(false)}
+        />
+      )}
 
       {/* Amend/Reassign modal — rendered inside the slide panel so it stacks above the backdrop */}
       {detail && amendTarget && (
