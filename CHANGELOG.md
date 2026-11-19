@@ -4,6 +4,10 @@ All notable changes to Engram will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Change Movie on completed movie jobs.** A movie that was filed under the wrong TMDB title (a `TITAN` disc filed as *Titan (2021)* instead of *Titan A.E. (2000)*) can now be corrected from its History detail without re-ripping. Search TMDB or enter a movie ID, review exactly which files will move (main feature and extras), and confirm. Nothing is overwritten: a destination that already exists, a folder shared with another job, a symlink, or a file outside your movies library blocks the correction with a reason. Every correction is journaled before any file moves, rolled back if it fails, finished or undone on the next start if Engram is interrupted, and kept as an audit entry with the previous identity. Contributions already sent to the fingerprint network or TheDiscDB are not changed.
+
 ## [0.45.2] - 2026-11-18
 
 _Highlights: discs identified by TheDiscDB get each episode on the right track again, complete Blu-ray rips are no longer mistaken for truncated ones, AI matching works with LM Studio and Ollama, German shows matched in German go to review far less often, and the TheTVDB numbering suggestion can be accepted on a disc with no known season._

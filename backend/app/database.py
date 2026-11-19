@@ -17,7 +17,7 @@ from app.config import settings
 from app.database_backup import backup_before_migrate, mark_startup_complete
 
 # Import all models so their tables are registered with SQLModel.metadata
-from app.models import AppConfig, DiscJob  # noqa: F401
+from app.models import AppConfig, DiscJob, MovieIdentityOperation  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

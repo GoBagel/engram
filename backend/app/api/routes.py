@@ -4864,6 +4864,79 @@ async def amend_title(
     return {"status": "amended", "title_id": title_id, "kind": request.target.kind}
 
 
+class MovieIdentityChangeRequest(BaseModel):
+    """Confirmed completed-movie correction (spec 2026-11-18)."""
+
+    tmdb_id: int = Field(gt=0)
+    token: str
+    confirm: bool = False
+
+
+class MovieIdentityRecoverRequest(BaseModel):
+    action: Literal["roll_forward", "roll_back"] | None = None
+
+
+def _movie_identity_http(e) -> HTTPException:
+    return HTTPException(status_code=e.status, detail=e.message)
+
+
+@router.get(
+    "/jobs/{job_id}/movie-identity/preview",
+    dependencies=[Depends(require_localhost_or_lan)],
+)
+async def preview_movie_identity(job_id: int, tmdb_id: int = Query(..., gt=0)) -> dict:
+    """Dry-run a completed-movie correction. Writes nothing."""
+    from app.services import movie_identity_service as svc
+
+    try:
+        return (await svc.build_preview(job_id, tmdb_id)).to_dict()
+    except svc.MovieIdentityError as e:
+        raise _movie_identity_http(e) from None
+
+
+@router.post(
+    "/jobs/{job_id}/movie-identity/change",
+    dependencies=[Depends(require_localhost_or_lan)],
+)
+async def change_movie_identity(
+    job_id: int, body: MovieIdentityChangeRequest, request: Request
+) -> dict:
+    """Relocate a completed movie's files to a corrected TMDB identity."""
+    from app.services import movie_identity_service as svc
+
+    actor = request.client.host if request.client else None
+    try:
+        return await svc.apply(job_id, body.tmdb_id, body.token, body.confirm, actor)
+    except svc.MovieIdentityError as e:
+        raise _movie_identity_http(e) from None
+
+
+@router.get(
+    "/jobs/{job_id}/movie-identity/operations",
+    dependencies=[Depends(require_localhost_or_lan)],
+)
+async def list_movie_identity_operations(job_id: int) -> list[dict]:
+    """Audit trail and journal of this job's corrections, newest first."""
+    from app.services import movie_identity_service as svc
+
+    return await svc.list_operations(job_id)
+
+
+@router.post(
+    "/jobs/{job_id}/movie-identity/recover",
+    dependencies=[Depends(require_localhost_or_lan)],
+)
+async def recover_movie_identity(job_id: int, body: MovieIdentityRecoverRequest) -> dict:
+    """Finish or undo an interrupted correction, based on where the files really are."""
+    from app.services import movie_identity_service as svc
+
+    try:
+        result = await svc.recover(job_id, body.action)
+    except svc.MovieIdentityError as e:
+        raise _movie_identity_http(e) from None
+    return result or {"status": "nothing_to_recover"}
+
+
 class ShowOrderingRequest(BaseModel):
     """Set a show's output ordering preference (#200)."""
 
