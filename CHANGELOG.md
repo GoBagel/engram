@@ -10,7 +10,7 @@ All notable changes to Engram will be documented in this file.
 
 ### Fixed
 
-- **The backend test suite now runs against a throwaway database and refuses to open a real one.** Running `pytest` from `backend/` opened `backend/engram.db` (the default `./engram.db` is relative to the working directory), and the integration tests wrote fixture rows into it, replaced the configured `app_config` row (the setup wizard reappeared and credentials were lost) and deleted job history. Tests now use a database in a directory created for the run, and while pytest is imported Engram refuses any SQLite file that is not in-memory or inside a registered test directory, and disables `ATTACH`. This affects contributors only: a packaged or served Engram is unchanged.
+- **The backend test suite now runs against a throwaway database and refuses to open a real one.** Running `pytest` from `backend/` opened `backend/engram.db` (the default `./engram.db` is relative to the working directory), and the integration tests wrote fixture rows into it, replaced the configured `app_config` row (the setup wizard reappeared and credentials were lost) and deleted job history. Tests now use a database in a directory created for the run, and while pytest is imported Engram refuses to open any SQLite file that is not in-memory or inside a registered test directory (including through captured connectors and ambiguous URIs) and disables `ATTACH`. This guards against accidents, not against code written to defeat it. This affects contributors only: a packaged or served Engram is unchanged.
 
 ## [0.45.2] - 2026-11-18
 

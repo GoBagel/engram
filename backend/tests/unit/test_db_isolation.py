@@ -307,6 +307,231 @@ class TestOpenersThatUsedToBypassTheUrlChecks:
 
 
 # --------------------------------------------------------------------------- #
+# Second review: URI semantics, captured connectors, a reversible ATTACH limit
+# --------------------------------------------------------------------------- #
+
+
+class TestUriSemantics:
+    """SQLite reads URIs in ways a naive parser does not; every ambiguity is refused."""
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "mode=memory&mode=rw",  # the later mode wins: a disk file (Codex repro)
+            "mode=memory&mode=rwc",
+            "mode=rwc&mode=memory",
+            "cache=shared&cache=private",
+            "mode=memory;mode=rwc",  # ';' separator
+        ],
+    )
+    def test_repeated_or_ambiguous_parameters_are_refused(self, query):
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(f"file:{CANARY}?{query}", uri=True)
+        assert not CANARY.exists()
+
+    def test_repeated_parameters_are_refused_even_for_a_registered_file(self, tmp_path):
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(f"file:{tmp_path / 'x.db'}?mode=memory&mode=rwc", uri=True)
+        assert not (tmp_path / "x.db").exists()
+
+    def test_a_single_mode_memory_is_in_memory_and_creates_nothing(self):
+        sqlite3.connect(f"file:{CANARY}?mode=memory", uri=True).close()
+        assert not CANARY.exists()
+
+    def test_percent_encoded_paths_are_decoded_before_judging(self, tmp_path):
+        from urllib.parse import quote
+
+        target = tmp_path / "enc.db"
+        sqlite3.connect(f"file:{quote(str(target), safe='')}?mode=rwc", uri=True).close()
+        assert target.exists()  # decoded to the registered path, so allowed
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(f"file:{quote(str(CANARY), safe='')}?mode=rwc", uri=True)
+
+    def test_without_the_uri_flag_a_file_string_is_a_literal_filename(self, tmp_path, monkeypatch):
+        """``file:/registered/x.db`` read as a URI looks safe; opened literally it is a path in cwd."""
+        monkeypatch.chdir(BACKEND)
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(f"file:{tmp_path / 'literal.db'}")
+        assert not (tmp_path / "literal.db").exists()
+
+    def test_a_non_local_uri_authority_is_refused_even_for_a_registered_path(self, tmp_path):
+        """Pins the explicit rule: the path alone would have been accepted."""
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(f"file://otherhost{tmp_path / 'a.db'}?mode=rwc", uri=True)
+        sqlite3.connect(f"file://localhost{tmp_path / 'local.db'}?mode=rwc", uri=True).close()
+        assert (tmp_path / "local.db").exists()
+
+    def test_bytes_and_pathlike_targets_are_judged_like_strings(self, tmp_path):
+        sqlite3.connect(os.fsencode(tmp_path / "bytes.db")).close()
+        sqlite3.connect(tmp_path / "pathlike.db").close()
+        assert (tmp_path / "bytes.db").exists() and (tmp_path / "pathlike.db").exists()
+
+    @pytest.mark.filterwarnings("ignore:Passing more than 1 positional argument:DeprecationWarning")
+    def test_the_uri_flag_given_positionally_changes_the_reading(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(BACKEND)
+        target = tmp_path / "pos.db"
+        args = (5.0, 0, "DEFERRED", True, None, 128)
+        sqlite3.connect(f"file:{target}?mode=rwc", *args, True).close()  # uri=True: URI reading
+        assert target.exists()
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(f"file:{target}?mode=rwc", *args, False)  # literal: a path in cwd
+
+
+class TestCapturedConnectors:
+    """The wrapper replaces module attributes; the audit hook sits below them."""
+
+    def test_the_original_connector_is_refused_for_an_unregistered_target(self):
+        original = db_guard._REAL_CONNECT
+        assert original is not sqlite3.connect
+        for target in (str(CANARY), CANARY, os.fsencode(CANARY)):
+            with pytest.raises(ProductionDatabaseAccessError):
+                original(target)
+        assert not CANARY.exists()
+
+    def test_partial_and_alias_references_are_refused(self):
+        import functools
+
+        alias = functools.partial(db_guard._REAL_CONNECT)
+        with pytest.raises(ProductionDatabaseAccessError):
+            alias(str(CANARY))
+
+    def test_direct_connection_construction_is_refused(self):
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.Connection(str(CANARY))
+        assert not CANARY.exists()
+
+    def test_sqlalchemy_creator_with_a_captured_connector_is_refused(self):
+        original = db_guard._REAL_CONNECT
+        engine = create_engine("sqlite://", creator=lambda: original(str(CANARY)))
+        with pytest.raises(ProductionDatabaseAccessError):
+            engine.connect()
+        engine.dispose()
+
+    def test_captured_connectors_still_work_for_registered_and_memory_targets(self, tmp_path):
+        original = db_guard._REAL_CONNECT
+        original(":memory:").close()
+        original(str(tmp_path / "ok.db")).close()
+        sqlite3.Connection(str(tmp_path / "direct.db")).close()
+
+    def test_a_connector_captured_before_the_guard_is_armed_is_still_refused(self, scratch):
+        script = (
+            "import sqlite3\n"
+            "early = sqlite3.connect; early_dbapi2 = sqlite3.dbapi2.connect\n"
+            "import pytest\n"
+            "from app import db_guard\n"
+            "db_guard.install_sqlite_guard()\n"
+            "for fn in (early, early_dbapi2):\n"
+            "    try:\n"
+            f"        fn({str(CANARY)!r})\n"
+            "    except db_guard.ProductionDatabaseAccessError:\n"
+            "        print('refused')\n"
+        )
+        proc = _run(["-c", script], cwd=scratch, timeout=60)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.stdout.split() == ["refused", "refused"]
+
+    def test_the_hook_checks_the_uri_reading_even_when_the_literal_reading_is_safe(
+        self, tmp_path, monkeypatch
+    ):
+        """In a registered cwd the literal filename is harmless; read as a URI it is the canary."""
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(ProductionDatabaseAccessError):
+            db_guard._REAL_CONNECT(f"file:{CANARY}?mode=rwc", uri=True)
+        assert not CANARY.exists()
+
+    def test_a_judged_target_does_not_stay_approved_for_a_later_bare_call(self, monkeypatch):
+        """The wrapper approved ``file::memory:`` as a URI; a later literal open must not inherit it."""
+        monkeypatch.chdir(
+            BACKEND
+        )  # unregistered: a literal 'file::memory:...' file would land here
+        name = "file::memory:?cache=shared"
+        sqlite3.connect(name, uri=True).close()
+        with pytest.raises(ProductionDatabaseAccessError):
+            db_guard._REAL_CONNECT(name)
+        assert not (BACKEND / name).exists()
+
+    def test_bare_file_uri_through_the_original_is_conservatively_refused(self):
+        """The audit event lacks the uri flag, so the hook needs both readings safe."""
+        with pytest.raises(ProductionDatabaseAccessError):
+            db_guard._REAL_CONNECT("file::memory:?cache=shared", uri=True)
+        sqlite3.connect("file::memory:?cache=shared", uri=True).close()  # the wrapper knows
+
+
+class TestAttachBanCannotBeUndone:
+    def _conn(self):
+        return sqlite3.connect(":memory:")
+
+    def test_the_attach_limit_cannot_be_raised(self):
+        conn = self._conn()
+        try:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)  # lowering or keeping is fine
+            with pytest.raises(ProductionDatabaseAccessError):
+                conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 10)
+            assert conn.getlimit(sqlite3.SQLITE_LIMIT_ATTACHED) == 0
+        finally:
+            conn.close()
+
+    def test_attach_and_vacuum_into_stay_blocked_after_an_attempt_to_raise_the_limit(self):
+        conn = self._conn()
+        try:
+            conn.execute("create table t (x)")
+            with pytest.raises(ProductionDatabaseAccessError):
+                conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 10)
+            with pytest.raises(sqlite3.Error):
+                conn.execute("ATTACH DATABASE ? AS other", (str(CANARY),))
+            with pytest.raises(sqlite3.Error):
+                conn.execute("VACUUM INTO ?", (str(CANARY),))
+        finally:
+            conn.close()
+
+    def test_other_limits_are_still_adjustable(self):
+        conn = self._conn()
+        try:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 1_000_000)
+        finally:
+            conn.close()
+
+    def test_a_callers_own_connection_class_is_pinned_too(self):
+        class MyConnection(sqlite3.Connection):
+            pass
+
+        conn = sqlite3.connect(":memory:", factory=MyConnection)
+        try:
+            assert isinstance(conn, MyConnection)
+            with pytest.raises(ProductionDatabaseAccessError):
+                conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 10)
+        finally:
+            conn.close()
+
+    @pytest.mark.filterwarnings("ignore:Passing more than 1 positional argument:DeprecationWarning")
+    def test_a_positional_factory_is_pinned_too(self):
+        conn = sqlite3.connect(":memory:", 5.0, 0, "DEFERRED", True, sqlite3.Connection)
+        try:
+            with pytest.raises(ProductionDatabaseAccessError):
+                conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 10)
+        finally:
+            conn.close()
+
+    def test_engine_connections_are_pinned(self):
+        engine = create_engine("sqlite://")
+        try:
+            with engine.connect() as conn:
+                raw = conn.connection.driver_connection
+                with pytest.raises(ProductionDatabaseAccessError):
+                    raw.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 10)
+        finally:
+            engine.dispose()
+
+    def test_it_fails_closed_when_the_ban_cannot_be_enforced(self, monkeypatch):
+        """No SQLITE_LIMIT_ATTACHED means no ban: refuse to open anything, never allow ATTACH."""
+        monkeypatch.delattr(sqlite3, "SQLITE_LIMIT_ATTACHED")
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(":memory:")
+        with pytest.raises(ProductionDatabaseAccessError):
+            db_guard.install_sqlite_guard()
+
+
+# --------------------------------------------------------------------------- #
 # Connection-level check (second opinion behind the wrapper)
 # --------------------------------------------------------------------------- #
 
@@ -532,6 +757,14 @@ def test_guard_and_wrapper_are_inert_in_a_process_that_never_imported_pytest(scr
             "import app.config as c, app.database\n"
             "assert not getattr(sqlite3.connect, '_engram_guard', False), 'sqlite3 was wrapped'\n"
             "assert not getattr(sqlite3.dbapi2.connect, '_engram_guard', False)\n"
+            "import app.db_guard as g\n"
+            "assert g.install_sqlite_guard() is False  # explicit arming is a no-op too\n"
+            "assert not getattr(sqlite3.connect, '_engram_guard', False)\n"
+            # Unrestricted behaviour: any path opens, ATTACH works, the limit is adjustable.
+            "conn = sqlite3.connect('plain.db'); conn.execute('create table t (x)')\n"
+            "conn.execute(\"ATTACH DATABASE 'other.db' AS o\")\n"
+            "conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 10)\n"
+            "conn.close()\n"
             "print(c.settings.database_url)",
         ],
         cwd=scratch,
@@ -539,6 +772,7 @@ def test_guard_and_wrapper_are_inert_in_a_process_that_never_imported_pytest(scr
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == CANARY_URL  # importing settings and the engine opens nothing
+    assert (scratch / "plain.db").exists()  # and a plain process is not restricted
 
 
 def test_conftest_overrides_a_hostile_ambient_database_url(scratch):

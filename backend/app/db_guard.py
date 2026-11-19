@@ -17,27 +17,43 @@ Layers, outermost first:
 
 1. ``enforce_test_database_isolation(url)``: the configured URL, at ``app.config`` import,
    ``init_db()`` and the sync engine factory. Gives a clear error early.
-2. ``install_sqlite_guard()``: wraps ``sqlite3.connect`` (and ``sqlite3.dbapi2.connect``,
-   which SQLAlchemy uses; aiosqlite calls ``sqlite3.connect``). The refusal happens BEFORE
-   the DBAPI connection exists, so no file is created, and it covers every opener
-   regardless of module: engines, the backup helper, the TMDB and transcript caches,
-   Alembic helpers and scripts. It also sets ``SQLITE_LIMIT_ATTACHED`` to 0 on each
-   connection, so ``ATTACH DATABASE`` cannot reach a second file.
-3. ``enforce_connection_isolation(conn)``: the engines' connect hook asks SQLite which
+2. ``install_sqlite_guard()`` wraps ``sqlite3.connect`` and ``sqlite3.dbapi2.connect`` (the
+   one SQLAlchemy calls; aiosqlite calls ``sqlite3.connect``). It judges the target with
+   the exact semantics SQLite will use (the ``uri`` flag is honoured; URI parameters that
+   could change the meaning, such as a repeated ``mode``, are refused), BEFORE the file
+   exists. Connections it opens are instances of a ``Connection`` subclass that refuses to
+   raise ``SQLITE_LIMIT_ATTACHED`` above 0, so ``ATTACH DATABASE`` and ``VACUUM INTO``
+   cannot reach a second file. If that cannot be enforced on this Python/SQLite, it
+   refuses to open anything rather than fail open.
+3. A ``sys.addaudithook`` hook on the ``sqlite3.connect`` audit event, which CPython raises
+   from below the replaceable module attributes. It covers openers the wrapper never sees:
+   a connector captured before the wrapper was installed, ``sqlite3.Connection(...)``
+   built directly, a ``creator=`` callable. The event carries the target but not the
+   ``uri`` flag, so for a ``file:`` string it requires BOTH readings (literal filename and
+   URI) to be safe; calls the wrapper already judged precisely pass via a thread-local mark.
+4. ``enforce_connection_isolation(conn)``: the engines' connect hook asks SQLite which
    files the connection is bound to (``PRAGMA database_list``, every entry).
 
 Production is untouched: all of this is inert unless ``pytest`` is in ``sys.modules``,
-which no packaged or served Engram process ever imports.
+which no packaged or served Engram process ever imports. The audit hook cannot be removed
+once added, so it is only ever added under pytest, and it does nothing if pytest is gone.
 
 Known limits, stated rather than hidden:
 
-- Activation is "pytest has been imported". Every pytest run imports it before test code,
-  but a connection that was opened before ``pytest`` was imported is not retro-checked.
-- ``sqlite3.Connection(...)`` constructed directly bypasses the ``connect`` wrapper.
+- Activation is "pytest has been imported". Importing pytest alone installs nothing; the
+  guard arms when ``tests/conftest.py`` or ``app.config`` runs (every pytest run for this
+  project does one of them before test code). A connection opened before then is not
+  retro-checked.
+- Connections that bypass the wrapper (a captured connector, ``sqlite3.Connection(...)``)
+  have their TARGET checked by the audit hook but are not given the ATTACH ban: ATTACH from
+  such a connection, which is itself bound to a registered database, is not blocked.
+- The ATTACH ban is a connection setting; code that deliberately goes around the Python
+  API (ctypes, a patched ``sqlite3``) can undo it. This guards against accidents, not
+  against code written to defeat it.
 - Paths are checked by resolving symlinks and ``..`` and then opened later; a symlink
   swapped in between, or a hard link to a real database placed inside a registered
   directory, is not detected. The registered directories are private, freshly created
-  temp directories, so this needs a hostile actor on the same machine.
+  directories, so this needs a hostile actor on the same machine.
 
 This module imports nothing from the rest of the app, so ``app.config`` can call it while
 the settings object is being created.
@@ -48,8 +64,9 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+import threading
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -152,22 +169,45 @@ def enforce_test_database_isolation(database_url: str, *, under_pytest: bool | N
         raise _refusal(_describe(database_url))
 
 
-def _file_from_sqlite_target(database, uri: bool) -> str | None:
-    """The filesystem path a ``sqlite3.connect`` target names; None for in-memory."""
+# --------------------------------------------------------------------------- #
+# Reading a sqlite3.connect target the way SQLite does
+# --------------------------------------------------------------------------- #
+
+
+def _as_str(database) -> str:
     if isinstance(database, (bytes, bytearray)):
-        database = os.fsdecode(database)
-    database = os.fspath(database)
-    if not database or database == ":memory:":
+        return os.fsdecode(database)
+    return os.fspath(database)
+
+
+def _file_from_sqlite_target(database, uri: bool) -> str | None:
+    """The filesystem path a ``sqlite3.connect`` target names; None for in-memory.
+
+    Mirrors SQLite: without ``uri=True`` the string is a literal filename even if it starts
+    with ``file:``; with it, only a ``file:`` string is parsed as a URI. Anything whose
+    meaning could differ between readers raises ValueError and is refused.
+    """
+    name = _as_str(database)
+    if not name or name == ":memory:":
         return None
-    if uri or database.startswith("file:"):
-        if not database.startswith("file:"):
-            return database
-        parsed = urlparse(database)
-        query = parse_qs(parsed.query)
-        if "memory" in query.get("mode", []) or parsed.path in ("", ":memory:"):
-            return None
-        return unquote(parsed.path)
-    return database
+    if not uri or not name.startswith("file:"):
+        return name
+    parsed = urlparse(name)
+    if parsed.netloc not in ("", "localhost"):
+        raise ValueError("ambiguous sqlite URI")  # SQLite itself rejects other authorities
+    params = parse_qsl(parsed.query, keep_blank_values=True)
+    keys = [key for key, _ in params]
+    if len(keys) != len(set(keys)):
+        # SQLite lets the last repeated parameter win (mode=memory&mode=rwc is a disk file),
+        # and readers disagree about which one counts, so a repeat is never accepted.
+        raise ValueError("repeated sqlite URI parameter")
+    options = dict(params)
+    path = unquote(parsed.path)
+    if options.get("mode") == "memory" or path in ("", ":memory:"):
+        if options.get("mode") not in (None, "memory"):
+            raise ValueError("ambiguous sqlite URI")
+        return None
+    return path
 
 
 def check_sqlite_target(database, *, uri: bool = False) -> None:
@@ -175,9 +215,20 @@ def check_sqlite_target(database, *, uri: bool = False) -> None:
     try:
         file = _file_from_sqlite_target(database, uri)
     except (TypeError, ValueError):
-        raise _refusal("<unreadable sqlite target>") from None
+        raise _refusal("<unreadable or ambiguous sqlite target>") from None
     if file is not None and not is_isolated_path(file):
         raise _refusal(file)
+
+
+def _check_target_either_reading(database) -> None:
+    """For callers that cannot see ``uri``: a ``file:`` string must be safe both ways."""
+    check_sqlite_target(database, uri=False)
+    try:
+        is_uri_form = _as_str(database).startswith("file:")
+    except (TypeError, ValueError):
+        raise _refusal("<unreadable sqlite target>") from None
+    if is_uri_form:
+        check_sqlite_target(database, uri=True)
 
 
 def enforce_connection_isolation(dbapi_connection, *, under_pytest: bool | None = None) -> None:
@@ -212,37 +263,101 @@ def session_isolation_problems(**urls: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# sqlite3.connect wrapper
+# sqlite3.connect wrapper, ATTACH ban, and the audit hook
 # --------------------------------------------------------------------------- #
 
 _REAL_CONNECT = sqlite3.connect
+_state = threading.local()  # the target the wrapper has already judged on this thread
+_GUARDED_CLASSES: dict[type, type] = {}
+_hook_installed = False
+
+
+def _attached_limit_category() -> int:
+    category = getattr(sqlite3, "SQLITE_LIMIT_ATTACHED", None)
+    if category is None or not hasattr(sqlite3.Connection, "setlimit"):
+        raise ProductionDatabaseAccessError(
+            "Cannot disable ATTACH DATABASE on this Python/SQLite (sqlite3.Connection.setlimit "
+            "or SQLITE_LIMIT_ATTACHED is missing), so no database may be opened under pytest."
+        )
+    return category
+
+
+class _GuardedConnectionMixin:
+    """Keeps SQLITE_LIMIT_ATTACHED at 0 for the life of the connection."""
+
+    def setlimit(self, category, limit):
+        if category == _attached_limit_category() and limit != 0:
+            raise ProductionDatabaseAccessError(
+                "ATTACH DATABASE is disabled under pytest; the attach limit cannot be raised."
+            )
+        return super().setlimit(category, limit)
+
+
+def _guarded_class(base: type) -> type:
+    if issubclass(base, _GuardedConnectionMixin):
+        return base
+    cls = _GUARDED_CLASSES.get(base)
+    if cls is None:
+        cls = _GUARDED_CLASSES[base] = type(
+            f"Guarded{base.__name__}", (_GuardedConnectionMixin, base), {}
+        )
+    return cls
 
 
 def _guarded_connect(database, *args, **kwargs):
-    if running_under_pytest():
-        uri = kwargs.get("uri", args[6] if len(args) > 6 else False)
-        check_sqlite_target(database, uri=bool(uri))
-    conn = _REAL_CONNECT(database, *args, **kwargs)
-    if running_under_pytest():
-        # No ATTACH in tests: it could open a second, unchecked file on a checked connection.
-        limit = getattr(sqlite3, "SQLITE_LIMIT_ATTACHED", None)
-        if limit is not None and hasattr(conn, "setlimit"):
-            conn.setlimit(limit, 0)
+    if not running_under_pytest():
+        return _REAL_CONNECT(database, *args, **kwargs)
+
+    category = _attached_limit_category()  # fail closed before opening anything
+    uri = bool(kwargs.get("uri", args[6] if len(args) > 6 else False))
+    check_sqlite_target(database, uri=uri)
+
+    # Whatever Connection class the caller asked for (or the default) gets the ATTACH pin.
+    args = list(args)
+    if len(args) > 4:  # factory was passed positionally
+        args[4] = _guarded_class(args[4] or sqlite3.Connection)
+    else:
+        kwargs["factory"] = _guarded_class(kwargs.get("factory") or sqlite3.Connection)
+
+    _state.judged = _as_str(database)
+    try:
+        conn = _REAL_CONNECT(database, *args, **kwargs)
+    finally:
+        _state.judged = None
+    conn.setlimit(category, 0)
     return conn
 
 
 _guarded_connect._engram_guard = True  # type: ignore[attr-defined]
 
 
-def install_sqlite_guard() -> bool:
-    """Wrap ``sqlite3.connect`` and ``sqlite3.dbapi2.connect``. Idempotent; pytest only.
+def _audit_hook(event, args):
+    if event != "sqlite3.connect" or not running_under_pytest():
+        return
+    database = args[0]
+    try:
+        judged = getattr(_state, "judged", None)
+        if judged is not None and judged == _as_str(database):
+            return  # the wrapper already judged this exact call with the real uri flag
+    except (TypeError, ValueError):
+        pass
+    _check_target_either_reading(database)
 
-    Returns True when the wrapper is in place. Outside pytest it does nothing, so a served
-    or packaged Engram never has its sqlite3 module touched.
+
+def install_sqlite_guard() -> bool:
+    """Arm the guard: wrap ``sqlite3.connect`` and add the audit hook. Idempotent; pytest only.
+
+    Returns True when armed. Outside pytest it does nothing, so a served or packaged
+    Engram never has its sqlite3 module touched and no audit hook is ever added.
     """
+    global _hook_installed
     if not running_under_pytest():
         return False
+    _attached_limit_category()  # refuse to arm a guard that cannot ban ATTACH
     for module in (sqlite3, sqlite3.dbapi2):
         if not getattr(module.connect, "_engram_guard", False):
             module.connect = _guarded_connect
+    if not _hook_installed:
+        sys.addaudithook(_audit_hook)
+        _hook_installed = True
     return True
