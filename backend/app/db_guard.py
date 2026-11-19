@@ -19,20 +19,30 @@ Layers, outermost first:
    ``init_db()`` and the sync engine factory. Gives a clear error early.
 2. ``install_sqlite_guard()`` wraps ``sqlite3.connect`` and ``sqlite3.dbapi2.connect`` (the
    one SQLAlchemy calls; aiosqlite calls ``sqlite3.connect``). It judges the target with
-   the exact semantics SQLite will use (the ``uri`` flag is honoured; URI parameters that
-   could change the meaning, such as a repeated ``mode``, are refused), BEFORE the file
-   exists. Connections it opens are instances of a ``Connection`` subclass that refuses to
-   raise ``SQLITE_LIMIT_ATTACHED`` above 0, so ``ATTACH DATABASE`` and ``VACUUM INTO``
-   cannot reach a second file. If that cannot be enforced on this Python/SQLite, it
-   refuses to open anything rather than fail open.
+   SQLite's own rules, BEFORE the file exists: the ``uri`` flag is honoured; a ``file:``
+   URI is parsed the way SQLite parses it (not with ``urllib``, which strips tabs and
+   newlines); control characters, repeated parameters and non-local authorities are
+   refused. Connections it opens are an instance of a ``Connection`` subclass whose attach
+   limit is set to 0 inside ``__init__`` through the C method (so a caller's factory cannot
+   neutralise it, and an ``ATTACH`` in a factory's ``__init__`` already finds it in force)
+   and whose ``setlimit`` refuses to raise it. ``ATTACH DATABASE`` and ``VACUUM INTO`` then
+   fail. If the ban cannot be enforced on this Python/SQLite it refuses to open anything.
 3. A ``sys.addaudithook`` hook on the ``sqlite3.connect`` audit event, which CPython raises
    from below the replaceable module attributes. It covers openers the wrapper never sees:
    a connector captured before the wrapper was installed, ``sqlite3.Connection(...)``
    built directly, a ``creator=`` callable. The event carries the target but not the
    ``uri`` flag, so for a ``file:`` string it requires BOTH readings (literal filename and
-   URI) to be safe; calls the wrapper already judged precisely pass via a thread-local mark.
+   URI) to be safe. A call the wrapper already judged precisely passes via a thread-local
+   mark that the hook consumes on first use and the wrapper restores afterwards, so a
+   connect nested inside a factory cannot reuse or erase it.
 4. ``enforce_connection_isolation(conn)``: the engines' connect hook asks SQLite which
    files the connection is bound to (``PRAGMA database_list``, every entry).
+
+Exemption: coverage.py's own data files (``.coverage`` and ``.coverage.<suffix>``, in any
+directory) are neither location-checked nor ATTACH-pinned. ``pytest --cov`` (CI uses it)
+writes them in the working directory, and ``coverage combine`` needs ATTACH. A coverage
+file given a custom name via ``COVERAGE_FILE`` is not exempt and is refused unless it is
+in a registered directory.
 
 Production is untouched: all of this is inert unless ``pytest`` is in ``sys.modules``,
 which no packaged or served Engram process ever imports. The audit hook cannot be removed
@@ -47,9 +57,13 @@ Known limits, stated rather than hidden:
 - Connections that bypass the wrapper (a captured connector, ``sqlite3.Connection(...)``)
   have their TARGET checked by the audit hook but are not given the ATTACH ban: ATTACH from
   such a connection, which is itself bound to a registered database, is not blocked.
-- The ATTACH ban is a connection setting; code that deliberately goes around the Python
-  API (ctypes, a patched ``sqlite3``) can undo it. This guards against accidents, not
-  against code written to defeat it.
+- The ATTACH ban is a limit on the connection, kept at 0 by ``setlimit`` refusing to raise
+  it. Code that calls the base method directly (``sqlite3.Connection.setlimit(conn, ...)``),
+  or goes around the Python API (ctypes, a patched ``sqlite3``), can undo it. A connection
+  whose class a caller built without going through ``sqlite3.connect`` is not covered.
+  This guards against accidents, not against code written to defeat it.
+- Reading an existing real database ``mode=ro`` is refused like any other open; there is no
+  read-only exception.
 - Paths are checked by resolving symlinks and ``..`` and then opened later; a symlink
   swapped in between, or a hard link to a real database placed inside a registered
   directory, is not detected. The registered directories are private, freshly created
@@ -62,11 +76,11 @@ the settings object is being created.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import sys
 import threading
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlparse
 
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -174,10 +188,59 @@ def enforce_test_database_isolation(database_url: str, *, under_pytest: bool | N
 # --------------------------------------------------------------------------- #
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_PERCENT_ESCAPE = re.compile(rb"%([0-9A-Fa-f]{2})")
+# coverage.py's own data files: ``.coverage`` and ``.coverage.<suffix>`` (parallel mode,
+# which pytest-cov always uses). They are tooling output, not application databases, and
+# ``coverage combine`` needs ATTACH, so they are exempt from both the roots rule and the
+# ATTACH ban. CI runs ``pytest --cov=app``; without this exemption it would crash.
+_COVERAGE_DATA_FILE = re.compile(r"\.coverage(\..*)?")
+
+
 def _as_str(database) -> str:
     if isinstance(database, (bytes, bytearray)):
         return os.fsdecode(database)
-    return os.fspath(database)
+    return os.fsdecode(os.fspath(database))  # a PathLike may hand back bytes
+
+
+def _percent_decode(text: str) -> str:
+    """Decode ``%HH`` escapes exactly as SQLite does: hex pairs only, everything else literal."""
+    raw = text.encode("utf-8", "surrogateescape")
+    raw = _PERCENT_ESCAPE.sub(lambda m: bytes([int(m.group(1), 16)]), raw)
+    return raw.decode("utf-8", "surrogateescape")
+
+
+def _parse_sqlite_uri(name: str) -> tuple[str, dict[str, str]]:
+    """Split a ``file:`` URI the way SQLite's own parser does; returns (path, options).
+
+    Not ``urllib``: that silently strips tabs and newlines and splits queries differently, so
+    its reading of a URI can name a different file than SQLite opens. A control character
+    anywhere in the URI, raw or percent-decoded, is refused outright (SQLite truncates a
+    component at ``%00``, so a decoded NUL changes which parameters and which path count).
+    Repeated parameters are refused too: SQLite lets the last one win.
+    """
+    if _CONTROL_CHARS.search(name):
+        raise ValueError("control character in sqlite URI")
+    rest = name[len("file:") :].split("#", 1)[0]  # a fragment ends the URI
+    location, _, query = rest.partition("?")
+    if location.startswith("//"):
+        authority, slash, tail = location[2:].partition("/")
+        if authority not in ("", "localhost"):  # SQLite compares the raw text
+            raise ValueError("invalid sqlite URI authority")
+        location = slash + tail
+    path = _percent_decode(location)
+    if _CONTROL_CHARS.search(path):
+        raise ValueError("control character in sqlite URI path")
+    options: dict[str, str] = {}
+    for item in filter(None, query.split("&")):
+        key, _, value = item.partition("=")
+        key, value = _percent_decode(key), _percent_decode(value)
+        if _CONTROL_CHARS.search(key) or _CONTROL_CHARS.search(value):
+            raise ValueError("control character in sqlite URI parameter")
+        if key in options:
+            raise ValueError("repeated sqlite URI parameter")
+        options[key] = value
+    return path, options
 
 
 def _file_from_sqlite_target(database, uri: bool) -> str | None:
@@ -192,22 +255,17 @@ def _file_from_sqlite_target(database, uri: bool) -> str | None:
         return None
     if not uri or not name.startswith("file:"):
         return name
-    parsed = urlparse(name)
-    if parsed.netloc not in ("", "localhost"):
-        raise ValueError("ambiguous sqlite URI")  # SQLite itself rejects other authorities
-    params = parse_qsl(parsed.query, keep_blank_values=True)
-    keys = [key for key, _ in params]
-    if len(keys) != len(set(keys)):
-        # SQLite lets the last repeated parameter win (mode=memory&mode=rwc is a disk file),
-        # and readers disagree about which one counts, so a repeat is never accepted.
-        raise ValueError("repeated sqlite URI parameter")
-    options = dict(params)
-    path = unquote(parsed.path)
-    if options.get("mode") == "memory" or path in ("", ":memory:"):
-        if options.get("mode") not in (None, "memory"):
+    path, options = _parse_sqlite_uri(name)
+    mode = options.get("mode")
+    if mode == "memory" or path in ("", ":memory:"):
+        if mode not in (None, "memory"):
             raise ValueError("ambiguous sqlite URI")
         return None
     return path
+
+
+def _is_coverage_data_file(file: str) -> bool:
+    return bool(_COVERAGE_DATA_FILE.fullmatch(os.path.basename(file)))
 
 
 def check_sqlite_target(database, *, uri: bool = False) -> None:
@@ -216,7 +274,7 @@ def check_sqlite_target(database, *, uri: bool = False) -> None:
         file = _file_from_sqlite_target(database, uri)
     except (TypeError, ValueError):
         raise _refusal("<unreadable or ambiguous sqlite target>") from None
-    if file is not None and not is_isolated_path(file):
+    if file is not None and not is_isolated_path(file) and not _is_coverage_data_file(file):
         raise _refusal(file)
 
 
@@ -282,11 +340,29 @@ def _attached_limit_category() -> int:
     return category
 
 
-class _GuardedConnectionMixin:
-    """Keeps SQLITE_LIMIT_ATTACHED at 0 for the life of the connection."""
+def _pin_attach_limit(conn) -> None:
+    """Set the attach limit to 0 through the C method itself.
+
+    ``sqlite3.Connection.setlimit`` is called on the base class on purpose: a subclass that
+    overrides ``setlimit`` (a caller's factory, say) cannot turn the pin into a no-op.
+    """
+    sqlite3.Connection.setlimit(conn, _attached_limit_category(), 0)
+
+
+class _GuardedConnection(sqlite3.Connection):
+    """A Connection whose attach limit is 0 from the moment it exists, and stays there.
+
+    The pin is applied inside ``__init__``, so a caller's factory that runs ``ATTACH`` in its
+    own ``__init__`` (after ``super().__init__``) already finds it in force.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _pin_attach_limit(self)
 
     def setlimit(self, category, limit):
-        if category == _attached_limit_category() and limit != 0:
+        # A negative limit is SQLite's "query, do not change"; only raising is refused.
+        if category == _attached_limit_category() and limit > 0:
             raise ProductionDatabaseAccessError(
                 "ATTACH DATABASE is disabled under pytest; the attach limit cannot be raised."
             )
@@ -294,14 +370,35 @@ class _GuardedConnectionMixin:
 
 
 def _guarded_class(base: type) -> type:
-    if issubclass(base, _GuardedConnectionMixin):
+    """``base`` combined with the pinning behaviour; MRO is base, _GuardedConnection, Connection."""
+    if not issubclass(base, sqlite3.Connection):
+        return base  # not ours to wrap; sqlite3 raises its own error for a non-Connection class
+    if issubclass(base, _GuardedConnection):
         return base
+    if base is sqlite3.Connection:
+        return _GuardedConnection
     cls = _GUARDED_CLASSES.get(base)
     if cls is None:
         cls = _GUARDED_CLASSES[base] = type(
-            f"Guarded{base.__name__}", (_GuardedConnectionMixin, base), {}
+            f"Guarded{base.__name__}", (base, _GuardedConnection), {}
         )
     return cls
+
+
+def _guarded_factory(factory):
+    """The ``factory=`` to hand the real connect: pinned whatever the caller supplied."""
+    if factory is None:
+        return _GuardedConnection
+    if isinstance(factory, type):
+        return _guarded_class(factory)
+
+    def pinned(*args, **kwargs):  # a plain callable that builds a Connection some other way
+        conn = factory(*args, **kwargs)
+        if isinstance(conn, sqlite3.Connection):
+            _pin_attach_limit(conn)
+        return conn
+
+    return pinned
 
 
 def _guarded_connect(database, *args, **kwargs):
@@ -312,19 +409,28 @@ def _guarded_connect(database, *args, **kwargs):
     uri = bool(kwargs.get("uri", args[6] if len(args) > 6 else False))
     check_sqlite_target(database, uri=uri)
 
-    # Whatever Connection class the caller asked for (or the default) gets the ATTACH pin.
-    args = list(args)
-    if len(args) > 4:  # factory was passed positionally
-        args[4] = _guarded_class(args[4] or sqlite3.Connection)
-    else:
-        kwargs["factory"] = _guarded_class(kwargs.get("factory") or sqlite3.Connection)
+    file = _file_from_sqlite_target(database, uri)
+    exempt = file is not None and _is_coverage_data_file(file)  # coverage's own file: needs ATTACH
 
+    args = list(args)
+    if exempt:
+        pass  # no ATTACH pin; still marked as judged below so the audit hook does not redo it
+    elif len(args) > 4:  # factory was passed positionally
+        args[4] = _guarded_factory(args[4])
+    else:
+        kwargs["factory"] = _guarded_factory(kwargs.get("factory"))
+
+    # Tell the audit hook "this exact call was judged with its real uri flag". The mark is
+    # consumed by the hook on first use and restored afterwards, so a connect nested inside
+    # a caller's factory can neither reuse it nor erase the outer call's.
+    outer = getattr(_state, "judged", None)
     _state.judged = _as_str(database)
     try:
         conn = _REAL_CONNECT(database, *args, **kwargs)
     finally:
-        _state.judged = None
-    conn.setlimit(category, 0)
+        _state.judged = outer
+    if not exempt:
+        sqlite3.Connection.setlimit(conn, category, 0)
     return conn
 
 
@@ -332,15 +438,16 @@ _guarded_connect._engram_guard = True  # type: ignore[attr-defined]
 
 
 def _audit_hook(event, args):
-    if event != "sqlite3.connect" or not running_under_pytest():
+    if event != "sqlite3.connect" or not args or not running_under_pytest():
         return
     database = args[0]
     try:
-        judged = getattr(_state, "judged", None)
-        if judged is not None and judged == _as_str(database):
-            return  # the wrapper already judged this exact call with the real uri flag
+        target = _as_str(database)
     except (TypeError, ValueError):
-        pass
+        target = None
+    if target is not None and getattr(_state, "judged", None) == target:
+        _state.judged = None  # consumed: a second open of the same text is judged afresh
+        return
     _check_target_either_reading(database)
 
 

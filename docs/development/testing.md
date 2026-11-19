@@ -90,41 +90,23 @@ async def setup_db():
 
 The fixture above runs `DELETE` statements against whatever `DATABASE_URL` resolves to, and the
 default is the working-directory-relative `./engram.db`: your real database when you run pytest
-from `backend/`. Two layers make that safe:
+from `backend/`. Two things make that safe:
 
 1. `tests/conftest.py` sets `DATABASE_URL` to a throwaway file in a directory it creates,
    unconditionally, before anything imports `app` (an exported `DATABASE_URL` in your shell is
    overridden too), and registers that directory and pytest's basetemp as the only places a test
-   may keep SQLite files. The directory is deleted when the session ends.
+   may keep SQLite files. If a test needs its own SQLite file, use `tmp_path` or `:memory:`.
 2. `app/db_guard.py` fails closed while `pytest` is imported (it does nothing in a served or
-   packaged Engram, which never imports it):
-   - `app.config`, `init_db()` and the sync engine factory refuse a configured URL that is not
-     in-memory or inside a registered directory.
-   - `sqlite3.connect` itself is wrapped, so other openers that go through it (the backup helper,
-     the TMDB and transcript caches, Alembic helpers, scripts) are refused with
-     `ProductionDatabaseAccessError` before any file exists. The target is judged the way SQLite
-     reads it: the `uri` flag is honoured and ambiguous URIs (a repeated `mode`, a non-local
-     authority) are refused.
-   - A `sqlite3.connect` audit hook sits below the replaceable module attributes, so a connector
-     captured earlier, a directly constructed `sqlite3.Connection` and a SQLAlchemy `creator=` are
-     checked too.
-   - Guarded connections have an attach limit of 0 that cannot be raised through the Python API,
-     so `ATTACH DATABASE` and `VACUUM INTO` fail. If that cannot be enforced on this Python/SQLite,
-     the guard refuses to arm.
-   - The engines' connect hook additionally checks every file SQLite reports for the connection.
+   packaged Engram, which never imports it): it refuses any SQLite file outside those directories
+   with `ProductionDatabaseAccessError` and disables `ATTACH`. coverage.py's own `.coverage*` files
+   are exempt, so `pytest --cov` (CI) keeps working.
 
-   The system temp directory is deliberately not trusted as a whole, because `TMPDIR` can name any
-   directory. If a test needs its own SQLite file, use `tmp_path`.
+If a pytest run aborts with that error, something bypassed `tests/conftest.py`. Fix the test; do not
+loosen the guard. It protects against accidents, not against code written to defeat it.
 
-If a pytest run aborts with that error, something bypassed `tests/conftest.py` (a custom
-`--rootdir`, a script that imports `app` under pytest, or a test that replaced
-`settings.database_url`). Fix the test; do not loosen the guard. It protects against accidents, not
-against code written to defeat it. Known limits are listed in the `app/db_guard.py` docstring: a
-connection opened before the guard was armed is not re-checked; connections that bypass the wrapper
-(a captured connector, a directly constructed `sqlite3.Connection`) have their target checked but do
-not get the attach ban; ctypes or a patched `sqlite3` can undo it; and symlink or hard-link tricks
-inside a registered directory are not detected. The regression tests are in
-`backend/tests/unit/test_db_isolation.py`.
+How it works, what it does and does not guarantee, how to verify isolation before the first run
+and how to troubleshoot a refusal: see [Database isolation under pytest](db-isolation.md). The
+regression tests are in `backend/tests/unit/test_db_isolation.py`.
 
 ### Frontend E2E
 

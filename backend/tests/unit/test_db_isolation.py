@@ -47,13 +47,31 @@ def _home_db_url() -> str:
     return f"sqlite+aiosqlite:///{Path.home() / '.engram' / 'engram.db'}"
 
 
+COVERAGE_CANARY = BACKEND / ".coverage.isolation-canary"  # gitignored; the exemption's own file
+STRAY_FILES = ("file:marker.sqlite?mode=memory", ".coverage.isolation-canary.2")
+
+
+COVERAGE_LOOKALIKES = (".coveragerc", "coverage.sqlite", "x.coverage", ".coverage-extra")
+
+
+def _remove_canaries():
+    CANARY.unlink(missing_ok=True)
+    COVERAGE_CANARY.unlink(missing_ok=True)
+    for (
+        name
+    ) in COVERAGE_LOOKALIKES:  # a broken guard could create these; .coveragerc changes coverage
+        (BACKEND / name).unlink(missing_ok=True)
+    for name in STRAY_FILES:
+        (BACKEND / name).unlink(missing_ok=True)
+
+
 @pytest.fixture(autouse=True)
 def _canary_guard():
     """Any test that leaves the canary behind has let something open an unregistered file."""
-    CANARY.unlink(missing_ok=True)
+    _remove_canaries()
     yield
-    existed = CANARY.exists()
-    CANARY.unlink(missing_ok=True)
+    existed = CANARY.exists() or any((BACKEND / name).exists() for name in STRAY_FILES[:1])
+    _remove_canaries()
     assert not existed, "a database was created outside the registered test directories"
 
 
@@ -532,6 +550,269 @@ class TestAttachBanCannotBeUndone:
 
 
 # --------------------------------------------------------------------------- #
+# Third review: the URI parser against real SQLite, marker reuse, constructor ATTACH,
+# and coverage.py (CI runs ``pytest --cov``)
+# --------------------------------------------------------------------------- #
+
+
+def _sqlite_opened_file(variant: str) -> str:
+    """Ask SQLite itself which file ``variant`` opened (``''`` means in-memory)."""
+    conn = db_guard._REAL_CONNECT(variant, uri=True)  # judged by the audit hook, both readings
+    try:
+        return conn.execute("PRAGMA database_list").fetchall()[0][2]
+    finally:
+        conn.close()
+
+
+class TestUriParserAgreesWithSqlite:
+    """The guard judges the path it computes; it must be the file SQLite really opens."""
+
+    def test_differential_against_real_sqlite(self, tmp_path, monkeypatch):
+        from urllib.parse import quote
+
+        work = tmp_path / "d"
+        (work / "sub").mkdir(parents=True)
+        monkeypatch.chdir(work)
+        existing = work / "exists.db"
+        sqlite3.connect(existing).close()
+        p = str(work / "a.db")
+        variants = [
+            f"file:{p}",
+            f"file://{p}",  # file:///abs
+            f"file://localhost{p}",
+            f"file:{p}?mode=rwc",
+            f"file:{p}?mode=rwc#fragment",
+            f"file:{p}#fragment",
+            f"file:{p}?",
+            f"file:{p}?cache=shared&mode=rwc",
+            f"file:{p}?mode=rwc&&cache=shared",
+            f"file:{p}?mo%64e=rwc",
+            f"file:{p}?mode=memory",
+            f"file:{p}?mo%64e=memory",
+            f"file:{p}?immutable=0&psow=0&nolock=0",
+            f"file:{p}?vfs=unix",
+            f"file:{existing}?mode=ro",
+            "file:rel.db",
+            "file:./rel2.db",
+            "file:sub%2fviaescape.db",
+            "file:sub%2Fupper.db",
+            f"file:{quote(p, safe='')}",  # every character escaped, including the slashes
+            f"file:{work}/q%3Fmark.db",  # an escaped '?' stays part of the name
+            f"file:{work}/h%23ash.db",
+            f"file:{work}/p%25ct.db",
+            f"file:{work}/p+lus.db",  # '+' is not a space
+            f"file:{work}/sp%20ace.db",
+            f"file:{work}/caf%C3%A9.db",
+            "file::memory:",
+            "file::memory:?cache=shared",
+            "file:?mode=memory",
+        ]
+        compared = 0
+        for variant in variants:
+            try:
+                ours = db_guard._file_from_sqlite_target(variant, True)
+            except ValueError:
+                continue  # refused as ambiguous: conservative by design
+            actual = _sqlite_opened_file(variant)
+            if ours is None:
+                assert actual == "", (variant, actual)
+            else:
+                assert Path(actual).resolve() == Path(ours).resolve(), (variant, ours, actual)
+            compared += 1
+        assert compared >= 25, f"only {compared} variants were compared; the corpus went vacuous"
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "file:/tmp/a\tb.db",  # urllib strips a tab; SQLite keeps it, so they name different files
+            "file:/tmp/a\nb.db",
+            "file:/tmp/a\rb.db",
+            "file:/tmp/a%09b.db",
+            "file:/tmp/a%0Ab.db",
+            "file:/tmp/a%00b.db",  # SQLite truncates the path here
+            "file:/tmp/a.db?mode=memory&mode%00x=rwc",  # ... and a key, making 'mode' repeat
+            "file:/tmp/a.db?mode%00x=rwc&mode=memory",
+            "file:/tmp/a.db?mode=memory%00rwc",
+            "file:/tmp/a.db?mo\tde=rwc",
+            "file:/tmp/a.db?mode=mem\tory",
+        ],
+    )
+    def test_control_characters_are_refused_not_interpreted(self, uri):
+        with pytest.raises(ValueError):
+            db_guard._file_from_sqlite_target(uri, True)
+
+    def test_a_tab_directory_next_to_a_registered_root_is_not_confused_with_it(self, tmp_path):
+        """urllib dropped the tab, so ``…/sa<TAB>fe/x.db`` was judged as ``…/safe/x.db``."""
+        safe = tmp_path / "safe"
+        safe.mkdir()
+        tabbed = tmp_path / "sa\tfe"
+        tabbed.mkdir()
+        db_guard.allow_test_root(safe)
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(f"file:{tabbed}/x.sqlite", uri=True)
+        assert not (tabbed / "x.sqlite").exists()
+
+    def test_nul_and_tab_uris_are_refused_for_an_unregistered_file(self):
+        for query in ("mode=memory&mode%00x=rwc", "mode%00x=rwc&mode=memory", "mo\tde=rwc"):
+            with pytest.raises(ProductionDatabaseAccessError):
+                sqlite3.connect(f"file:{CANARY}?{query}", uri=True)
+        assert not CANARY.exists()
+
+    def test_encoded_parameter_names_are_read_like_sqlite(self):
+        sqlite3.connect(f"file:{CANARY}?mo%64e=memory", uri=True).close()  # in-memory: allowed
+        assert not CANARY.exists()
+
+
+class TestMarkerCannotBeReusedOrErased:
+    def test_a_nested_bare_open_of_the_same_text_is_judged_afresh(self, monkeypatch):
+        """Same spelling, other uri flag: the literal reading is a file in cwd (unregistered)."""
+        monkeypatch.chdir(BACKEND)
+        original = db_guard._REAL_CONNECT
+
+        class SameTarget(sqlite3.Connection):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                original("file:marker.sqlite?mode=memory", uri=False).close()
+
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect("file:marker.sqlite?mode=memory", uri=True, factory=SameTarget)
+        assert not (BACKEND / "file:marker.sqlite?mode=memory").exists()
+
+    def test_the_mark_is_consumed_and_restored(self):
+        assert getattr(db_guard._state, "judged", None) is None
+        sqlite3.connect("file::memory:", uri=True).close()
+        assert db_guard._state.judged is None
+
+    def test_a_wrapped_connect_inside_a_factory_does_not_erase_the_outer_mark(self):
+        class Reentrant(sqlite3.Connection):
+            def __init__(self, *a, **k):
+                sqlite3.connect(":memory:").close()  # runs before super().__init__
+                super().__init__(*a, **k)
+
+        sqlite3.connect("file::memory:", uri=True, factory=Reentrant).close()  # must not refuse
+        assert db_guard._state.judged is None
+
+    def test_the_mark_is_restored_when_the_real_connect_raises(self):
+        with pytest.raises(sqlite3.Error):
+            sqlite3.connect("file::memory:?cache=invalid", uri=True)
+        assert db_guard._state.judged is None
+
+    def test_a_worker_thread_has_no_approval_from_its_parent(self, monkeypatch):
+        import threading
+
+        monkeypatch.chdir(BACKEND)
+        original = db_guard._REAL_CONNECT
+        outcome = []
+
+        class Threaded(sqlite3.Connection):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+
+                def worker():
+                    try:
+                        original("file:marker.sqlite?mode=memory", uri=False).close()
+                        outcome.append("opened")
+                    except ProductionDatabaseAccessError:
+                        outcome.append("refused")
+
+                t = threading.Thread(target=worker)
+                t.start()
+                t.join()
+
+        sqlite3.connect("file:marker.sqlite?mode=memory", uri=True, factory=Threaded).close()
+        assert outcome == ["refused"]
+
+
+class TestAttachPinHoldsFromTheFirstInstruction:
+    def test_an_attach_in_a_factorys_own_init_is_blocked(self, tmp_path):
+        class InitAttach(sqlite3.Connection):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.execute("ATTACH DATABASE ? AS extra", (str(tmp_path / "ctor.db"),))
+
+        with pytest.raises(sqlite3.Error, match="attached"):
+            sqlite3.connect(":memory:", factory=InitAttach)
+        assert not (tmp_path / "ctor.db").exists()
+
+    def test_a_factory_that_overrides_setlimit_cannot_neutralise_the_pin(self, tmp_path):
+        class IgnoreLimit(sqlite3.Connection):
+            def setlimit(self, category, limit):
+                return self.getlimit(category)  # swallows every call
+
+        conn = sqlite3.connect(":memory:", factory=IgnoreLimit)
+        try:
+            assert conn.getlimit(sqlite3.SQLITE_LIMIT_ATTACHED) == 0
+            with pytest.raises(sqlite3.Error):
+                conn.execute("ATTACH DATABASE ? AS o", (str(tmp_path / "o.db"),))
+        finally:
+            conn.close()
+
+    def test_a_plain_callable_factory_works_and_is_pinned(self):
+        conn = sqlite3.connect(":memory:", factory=lambda *a, **k: sqlite3.Connection(*a, **k))
+        try:
+            assert conn.getlimit(sqlite3.SQLITE_LIMIT_ATTACHED) == 0
+        finally:
+            conn.close()
+
+    def test_a_negative_limit_is_a_query_and_is_not_refused(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            assert conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, -1) == 0
+            assert conn.getlimit(sqlite3.SQLITE_LIMIT_ATTACHED) == 0
+        finally:
+            conn.close()
+
+
+class TestSmallRobustnessItems:
+    def test_a_pathlike_that_returns_bytes_is_decoded(self, tmp_path):
+        class BytesPath:
+            def __fspath__(self):
+                return os.fsencode(tmp_path / "bytespath.db")
+
+        assert db_guard._as_str(BytesPath()) == str(tmp_path / "bytespath.db")
+
+    def test_a_malformed_audit_event_is_ignored_not_raised(self):
+        import sys as _sys
+
+        _sys.audit("sqlite3.connect")  # no arguments: real events always carry the target
+        _sys.audit("some.other.event", 1)
+
+
+class TestCoverageDataFiles:
+    """``pytest --cov`` (used by CI) writes ``.coverage.<suffix>`` in the working directory."""
+
+    def test_coverage_files_are_allowed_and_may_attach(self):
+        conn = sqlite3.connect(COVERAGE_CANARY)
+        try:
+            conn.execute("CREATE TABLE t (x)")
+            conn.execute(
+                "ATTACH DATABASE ? AS other", (str(BACKEND / ".coverage.isolation-canary.2"),)
+            )
+        finally:
+            conn.close()
+        assert COVERAGE_CANARY.exists()  # `coverage combine` depends on exactly this
+
+    @pytest.mark.parametrize(
+        "name", [".coveragerc", "coverage.sqlite", "x.coverage", ".coverage-extra"]
+    )
+    def test_lookalikes_are_not_exempt(self, name):
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(BACKEND / name)
+        assert not (BACKEND / name).exists()
+
+    def test_a_real_pytest_cov_run_completes(self, scratch):
+        """The CI invocation: coverage writes and combines its data files under the guard."""
+        proc = _nested_pytest(
+            f"{THIS_FILE}::test_session_database_is_isolated",
+            scratch,
+            extra_args=("--cov=app", "--cov-report="),
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert re.search(r"\b1 passed\b", proc.stdout)
+        assert "INTERNALERROR" not in proc.stdout + proc.stderr
+
+
+# --------------------------------------------------------------------------- #
 # Connection-level check (second opinion behind the wrapper)
 # --------------------------------------------------------------------------- #
 
@@ -723,7 +1004,7 @@ def scratch(tmp_path):
     return work
 
 
-def _nested_pytest(target, cwd, **env):
+def _nested_pytest(target, cwd, extra_args=(), **env):
     return _run(
         [
             "-m",
@@ -735,6 +1016,7 @@ def _nested_pytest(target, cwd, **env):
             "-p",
             "no:cacheprovider",
             "-q",
+            *extra_args,
             target,
         ],
         cwd=cwd,
