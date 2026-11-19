@@ -161,7 +161,16 @@ class TestValidateAiLocalProviders:
     async def test_local_provider_is_accepted_without_a_key(self, client):
         from unittest.mock import AsyncMock, patch
 
-        with patch("app.core.ai_client.complete_json", new=AsyncMock(return_value={"ok": True})):
+        # The model pre-flight must be stubbed: unpatched, it queries the real
+        # server on localhost:11434, so the test passes or fails depending on
+        # whether the machine running it has Ollama up and which models it holds.
+        with (
+            patch("app.core.ai_client.complete_json", new=AsyncMock(return_value={"ok": True})),
+            patch(
+                "app.api.validation._fetch_local_model_ids",
+                new=AsyncMock(return_value=([], None)),
+            ),
+        ):
             resp = await client.post(
                 "/api/validate/ai",
                 json={"provider": "ollama", "model": "llama3.1:8b"},
