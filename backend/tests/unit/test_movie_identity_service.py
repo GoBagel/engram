@@ -358,6 +358,22 @@ async def test_symlinked_file_is_refused(lib, tmp_path):
     assert outside.read_bytes() == b"SECRET" and os.path.islink(extras[0])
 
 
+async def test_symlinked_destination_folder_is_refused(lib, tmp_path):
+    job, old, main, extras = await _make(lib)
+    pv = await svc.build_preview(job.id, NEW_ID)
+    new_folder = Path(pv.moves[0].dst).parent
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    os.symlink(elsewhere, new_folder)
+    before = _tree(lib)
+    pv = await svc.build_preview(job.id, NEW_ID)
+    assert any("symlinked folder" in b for b in pv.blockers)
+    with pytest.raises(svc.MovieIdentityError):
+        await svc.apply(job.id, NEW_ID, pv.token, True, None)
+    assert list(elsewhere.iterdir()) == []
+    assert _tree(lib) == before
+
+
 async def test_file_outside_library_is_never_touched(lib, tmp_path):
     outside_dir = tmp_path / "elsewhere" / "Titan (2021)"
     outside_dir.mkdir(parents=True)
@@ -441,8 +457,11 @@ async def _break_commit_and_rollback(monkeypatch):
 async def test_failed_rollback_leaves_needs_recovery_then_roll_forward(lib, monkeypatch):
     job, old, main, extras = await _make(lib)
     real, _ = await _break_commit_and_rollback(monkeypatch)
-    with pytest.raises(svc.MovieIdentityError):
+    with pytest.raises(svc.MovieIdentityError) as exc:
         await _apply(job.id)
+    # The client must not be told the files were restored when they were not.
+    assert "were moved back" not in exc.value.message
+    assert "could not all be moved back" in exc.value.message
     [op] = await _ops(job.id)
     assert op.status == "needs_recovery" and "Rollback incomplete" in op.error
     assert (await _job(job.id)).tmdb_id == 111  # never claims success
@@ -566,6 +585,64 @@ def test_move_no_clobber_refuses_existing_destination(tmp_path):
     with pytest.raises(FileExistsError):
         svc.move_no_clobber(a, b)
     assert a.read_bytes() == b"A" and b.read_bytes() == b"B"
+
+
+def _failing_unlink(monkeypatch, target: Path, *, also_dst: Path | None = None):
+    real = os.unlink
+
+    def fake(p, *a, **k):
+        if Path(p) == target or (also_dst is not None and Path(p) == also_dst):
+            raise OSError(errno.EPERM, "injected unlink failure")
+        return real(p, *a, **k)
+
+    monkeypatch.setattr(svc.os, "unlink", fake)
+
+
+def test_failed_unlink_of_source_restores_the_pre_move_state(tmp_path, monkeypatch):
+    src, dst = tmp_path / "a.mkv", tmp_path / "b.mkv"
+    src.write_bytes(b"A")
+    _failing_unlink(monkeypatch, src)
+    with pytest.raises(OSError):
+        svc.move_no_clobber(src, dst)
+    assert src.read_bytes() == b"A" and not dst.exists()
+
+
+def test_failed_unlink_never_deletes_the_only_remaining_name(tmp_path, monkeypatch):
+    src, dst = tmp_path / "a.mkv", tmp_path / "b.mkv"
+    src.write_bytes(b"A")
+    real = os.unlink
+
+    def vanishing(p, *a, **k):
+        if Path(p) == src:
+            real(p)  # the source name goes away, yet the call reports failure
+            raise OSError(errno.EIO, "injected")
+        return real(p, *a, **k)
+
+    monkeypatch.setattr(svc.os, "unlink", vanishing)
+    svc.move_no_clobber(src, dst)  # completed move, not an error
+    assert dst.read_bytes() == b"A" and not src.exists()
+
+
+def test_both_names_left_is_reported_distinctly(tmp_path, monkeypatch):
+    src, dst = tmp_path / "a.mkv", tmp_path / "b.mkv"
+    src.write_bytes(b"A")
+    _failing_unlink(monkeypatch, src, also_dst=dst)
+    with pytest.raises(svc.MoveLeftBothNames):
+        svc.move_no_clobber(src, dst)
+    assert src.exists() and dst.exists()
+
+
+async def test_both_names_left_is_needs_recovery_not_rolled_back(lib, monkeypatch):
+    job, old, main, extras = await _make(lib)
+
+    def both(src, dst, op_id="x"):
+        raise svc.MoveLeftBothNames("both exist")
+
+    monkeypatch.setattr(svc, "move_no_clobber", both)
+    with pytest.raises(svc.MovieIdentityError):
+        await _apply(job.id)
+    [op] = await _ops(job.id)
+    assert op.status == "needs_recovery"
 
 
 def test_cross_device_move_copies_verifies_then_deletes(tmp_path, monkeypatch):

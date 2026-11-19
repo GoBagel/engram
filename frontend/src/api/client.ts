@@ -626,3 +626,30 @@ export async function changeMovieIdentity(
     body: JSON.stringify({ tmdb_id: tmdbId, token, confirm: true }),
   });
 }
+
+export interface MovieIdentityOperation {
+  operation_id: string;
+  job_id: number;
+  status: string;
+  error: string | null;
+  proposed: MovieIdentitySnapshot;
+}
+
+/** The journal of a job's corrections, newest first. */
+export async function listMovieIdentityOperations(
+  jobId: number,
+): Promise<MovieIdentityOperation[]> {
+  return apiFetch<MovieIdentityOperation[]>(`/api/jobs/${jobId}/movie-identity/operations`);
+}
+
+/** Finish (`roll_forward`) or undo (`roll_back`) an interrupted correction; no action lets the server decide. */
+export async function recoverMovieIdentity(
+  jobId: number,
+  action?: "roll_forward" | "roll_back",
+): Promise<{ status: string }> {
+  return apiFetch(`/api/jobs/${jobId}/movie-identity/recover`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: action ?? null }),
+  });
+}

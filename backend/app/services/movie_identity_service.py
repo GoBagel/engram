@@ -123,6 +123,10 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+class MoveLeftBothNames(OSError):
+    """A move failed and the file is present under both names (needs hand recovery)."""
+
+
 def _publish_no_clobber(src: Path, dst: Path) -> bool:
     """Make ``dst`` appear atomically, failing if it already exists.
 
@@ -170,13 +174,18 @@ def move_no_clobber(src: Path, dst: Path, op_id: str = "x") -> None:
         return
     try:
         os.unlink(src)
-    except OSError:
-        # Both names exist: never leave the file duplicated under the new name
-        # while the journal says it has not moved.
+    except OSError as e:
+        if not os.path.lexists(src):
+            # The source name is already gone and ``dst`` is the only name left:
+            # that is a completed move, and removing ``dst`` would destroy the file.
+            return
+        # The source survived, so ``dst`` is a second name (hard link) or a verified
+        # copy of it. Drop ``dst`` to restore the pre-move state, never the reverse.
         try:
             os.unlink(dst)
-        except OSError:
-            logger.error(f"Could not remove {src} after moving it to {dst}; both exist")
+        except OSError as e2:
+            logger.error(f"Could not remove {src} after moving it to {dst}; both exist: {e2}")
+            raise MoveLeftBothNames(f"{src} and {dst} both exist after a failed move: {e2}") from e
         raise
 
 
@@ -419,9 +428,13 @@ def _plan(job, titles, cfg, tmdb_id, details, active_op, other_paths) -> Preview
         else:
             dst = new_extras / src.name
         pv.moves.append(PlannedMove(t.id, role, str(src), str(dst)))
-        _check_source(pv, src, resolved_root)
+        _check_source(pv, src, resolved_root, root)
 
     pv.proposed["final_path"] = str(new_folder / new_main_name)
+    for d in (new_folder, new_extras):
+        link = _symlinked_component(d, root, resolved_root)
+        if link is not None:
+            pv.blockers.append(f"Refusing to move into a symlinked folder: {link}")
     _check_destinations(pv, new_folder, other_paths, old_folder)
 
     # Directories the operation may tidy up after, if (and only if) empty.
@@ -444,7 +457,30 @@ def _plan(job, titles, cfg, tmdb_id, details, active_op, other_paths) -> Preview
     return pv
 
 
-def _check_source(pv: Preview, src: Path, resolved_root: Path) -> None:
+def _symlinked_component(path: Path, root: Path, resolved_root: Path) -> Path | None:
+    """The first symlink between the library root and ``path`` (inclusive), if any.
+
+    Only the final name was checked before; a symlinked folder in the middle
+    sends the bytes somewhere other than the planned path.
+    """
+    for base in (root, resolved_root):
+        try:
+            rel = path.relative_to(base)
+        except ValueError:
+            continue
+        cur = base
+        for part in rel.parts:
+            cur = cur / part
+            if os.path.islink(cur):
+                return cur
+        return None
+    return None
+
+
+def _check_source(pv: Preview, src: Path, resolved_root: Path, root: Path | None = None) -> None:
+    link = _symlinked_component(src, root or resolved_root, resolved_root)
+    if link is not None and link != src:
+        pv.blockers.append(f"Refusing to move through a symlinked folder: {link}")
     if os.path.islink(src):
         pv.blockers.append(f"Refusing to move a symlink: {src.name}")
     elif not src.is_file():
@@ -558,9 +594,17 @@ async def apply(job_id: int, tmdb_id: int, token: str, confirm: bool, actor: str
             await _run_moves(op_id, moves)
         except Exception as e:  # noqa: BLE001 - every failure must roll back
             logger.error(f"Movie correction {op_id}: move failed: {e}", exc_info=True)
-            await _roll_back_or_flag(op_id, moves, f"Move failed: {e}")
+            settled = await _roll_back_or_flag(
+                op_id, moves, f"Move failed: {e}", force_flag=isinstance(e, MoveLeftBothNames)
+            )
+            if settled == "needs_recovery":
+                raise MovieIdentityError(
+                    409,
+                    f"The correction failed and some files could not be restored: {e}. "
+                    "Use Recover on the Change Movie dialog to finish or undo it.",
+                ) from e
             raise MovieIdentityError(
-                409, f"The correction failed and was rolled back where possible: {e}"
+                409, f"The correction failed and every file was put back: {e}"
             ) from e
 
         await _save_op(op_id, status="committing")
@@ -568,7 +612,13 @@ async def apply(job_id: int, tmdb_id: int, token: str, confirm: bool, actor: str
             await _commit(op_id)
         except Exception as e:  # noqa: BLE001
             logger.error(f"Movie correction {op_id}: DB commit failed: {e}", exc_info=True)
-            await _roll_back_or_flag(op_id, moves, f"Database commit failed: {e}")
+            settled = await _roll_back_or_flag(op_id, moves, f"Database commit failed: {e}")
+            if settled == "needs_recovery":
+                raise MovieIdentityError(
+                    409,
+                    f"Saving the correction failed and the files could not all be moved "
+                    f"back: {e}. Use Recover on the Change Movie dialog to finish or undo it.",
+                ) from e
             raise MovieIdentityError(
                 409, f"Saving the correction failed and the files were moved back: {e}"
             ) from e
@@ -638,8 +688,13 @@ async def _undo_moves(op_id: str, moves: list[PlannedMove]) -> list[str]:
     return failures
 
 
-async def _roll_back_or_flag(op_id: str, moves: list[PlannedMove], reason: str) -> None:
+async def _roll_back_or_flag(
+    op_id: str, moves: list[PlannedMove], reason: str, *, force_flag: bool = False
+) -> str:
+    """Undo what was moved; returns the journal status it settled on."""
     failures = await _undo_moves(op_id, moves)
+    if force_flag and not failures:
+        failures = ["a file is present under both its old and new name"]
     if failures:
         await _save_op(
             op_id,
@@ -647,13 +702,14 @@ async def _roll_back_or_flag(op_id: str, moves: list[PlannedMove], reason: str) 
             error=f"{reason}. Rollback incomplete: " + "; ".join(failures),
             moves_json=json.dumps([x.to_json() for x in moves]),
         )
-    else:
-        await _save_op(
-            op_id,
-            status="rolled_back",
-            error=reason,
-            moves_json=json.dumps([x.to_json() for x in moves]),
-        )
+        return "needs_recovery"
+    await _save_op(
+        op_id,
+        status="rolled_back",
+        error=reason,
+        moves_json=json.dumps([x.to_json() for x in moves]),
+    )
+    return "rolled_back"
 
 
 async def _commit(op_id: str) -> None:

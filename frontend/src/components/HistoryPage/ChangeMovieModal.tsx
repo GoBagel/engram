@@ -3,7 +3,10 @@ import { SvPanel, SvLabel, sv } from "../../app/components/synapse";
 import {
   changeMovieIdentity,
   errorDetail,
+  listMovieIdentityOperations,
   previewMovieIdentity,
+  recoverMovieIdentity,
+  type MovieIdentityOperation,
   type MovieIdentityPreview,
 } from "../../api/client";
 
@@ -72,6 +75,35 @@ export function ChangeMovieModal({
   }, [handleClose]);
 
   useEffect(() => () => clearTimeout(timer.current), []);
+
+  // A correction that failed half-way leaves a journal row in needs_recovery;
+  // surface it here with the way out, since Apply is blocked while it exists.
+  const [stuck, setStuck] = useState<MovieIdentityOperation | null>(null);
+  const refreshStuck = useCallback(async () => {
+    try {
+      const ops = await listMovieIdentityOperations(jobId);
+      setStuck(ops.find((o) => o.status === "needs_recovery") ?? null);
+    } catch {
+      setStuck(null);
+    }
+  }, [jobId]);
+  useEffect(() => {
+    void refreshStuck();
+  }, [refreshStuck]);
+
+  async function recover(action?: "roll_forward" | "roll_back") {
+    setBusy(true);
+    setError(null);
+    try {
+      await recoverMovieIdentity(jobId, action);
+      await refreshStuck();
+      onApplied();
+    } catch (e) {
+      setError(errorDetail(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   function onQuery(q: string) {
     setQuery(q);
@@ -280,6 +312,44 @@ export function ChangeMovieModal({
                     ! {w}
                   </div>
                 ))}
+              </div>
+            )}
+
+            {stuck && (
+              <div
+                role="alert"
+                aria-label="Recovery needed"
+                style={{ fontFamily: sv.mono, fontSize: 11, color: sv.amber, lineHeight: 1.6 }}
+              >
+                <div>
+                  An earlier correction did not finish and the files may be half-moved:{" "}
+                  {stuck.error ?? "manual recovery needed"}
+                </div>
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                  {(
+                    [
+                      ["Check again", undefined],
+                      ["Finish correction", "roll_forward"],
+                      ["Undo correction", "roll_back"],
+                    ] as const
+                  ).map(([label, action]) => (
+                    <button
+                      key={label}
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void recover(action)}
+                      style={{
+                        ...buttonBase,
+                        color: sv.amber,
+                        border: `1px solid ${sv.amber}`,
+                        background: "transparent",
+                        opacity: busy ? 0.5 : 1,
+                      }}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
 

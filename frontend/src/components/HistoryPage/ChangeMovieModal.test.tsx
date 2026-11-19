@@ -5,6 +5,8 @@ import { ChangeMovieModal } from "./ChangeMovieModal";
 
 const preview = vi.fn();
 const change = vi.fn();
+const listOps = vi.fn();
+const recover = vi.fn();
 
 vi.mock("../../api/client", async (orig) => {
   const actual = await orig<typeof import("../../api/client")>();
@@ -12,6 +14,8 @@ vi.mock("../../api/client", async (orig) => {
     ...actual,
     previewMovieIdentity: (...a: unknown[]) => preview(...a),
     changeMovieIdentity: (...a: unknown[]) => change(...a),
+    listMovieIdentityOperations: (...a: unknown[]) => listOps(...a),
+    recoverMovieIdentity: (...a: unknown[]) => recover(...a),
   };
 });
 
@@ -57,6 +61,22 @@ describe("ChangeMovieModal", () => {
   beforeEach(() => {
     preview.mockReset();
     change.mockReset();
+    listOps.mockReset();
+    recover.mockReset();
+    listOps.mockResolvedValue([]);
+  });
+
+  it("offers recovery actions when a correction is stuck in needs_recovery", async () => {
+    listOps.mockResolvedValue([
+      { operation_id: "op", job_id: 7, status: "needs_recovery", error: "Rollback incomplete", proposed: {} },
+    ]);
+    recover.mockResolvedValue({ status: "rolled_back" });
+    setup();
+    await screen.findByText(/Rollback incomplete/);
+    listOps.mockResolvedValue([]);
+    fireEvent.click(screen.getByRole("button", { name: /undo correction/i }));
+    await waitFor(() => expect(recover).toHaveBeenCalledWith(7, "roll_back"));
+    await waitFor(() => expect(screen.queryByText(/Rollback incomplete/)).toBeNull());
   });
 
   it("shows the current identity and keeps apply disabled until a clean preview", () => {

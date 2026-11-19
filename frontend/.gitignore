@@ -1,0 +1,4 @@
+
+# tsc emit of the Vite config shadows vite.config.ts (Vite prefers .js)
+vite.config.js
+vite.config.d.ts
