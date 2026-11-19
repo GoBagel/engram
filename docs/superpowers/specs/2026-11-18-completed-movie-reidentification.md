@@ -1,6 +1,6 @@
 # Completed-job movie re-identification
 
-**Status:** proposed design (implementation not started)  
+**Status:** implemented on `feat/completed-movie-reidentification` (v1: library-mode movie jobs; Playwright not added, see Implementation notes)  
 **Repository:** `GoBagel/engram`  
 **Branch:** `feat/completed-movie-reidentification`  
 **Date:** 2026-11-18
@@ -118,3 +118,12 @@ Avoid making this available for completed TV or non-completed jobs in v1.
 ## Follow-on issue: false-positive classification
 
 Investigate the reported `tmdb+heuristic` confidence **95%** for `TITAN` → `Titan (2021)`, despite `Titan A.E. (2000)` being the intended film, plus the mismatched TheDiscDB panel. Trace exact confidence computation, disc fingerprint/matching provenance, and how conflicting signals influence auto-organization. Propose confidence caps and mandatory review for unresolved identity conflicts. Keep this separate from completed-job correction.
+
+## Implementation notes
+
+- Service: `app/services/movie_identity_service.py`; journal/audit table `movie_identity_operations` (migration `d7a1f4c93b28`); routes `GET .../movie-identity/preview`, `POST .../change`, `GET .../operations`, `POST .../recover`, all `require_localhost_or_lan`. UI: `HistoryPage/ChangeMovieModal.tsx`.
+- Naming is shared with fresh rips through `organizer.plan_movie_names`, so a corrected movie lands exactly where it would have been filed.
+- v1 scope: `destination_mode == "library"` movie jobs only (imports and in-place jobs keep files outside the library). A destination `Extras/` file that already exists blocks the correction; there is no renumbering.
+- Moves are no-clobber (`os.link` then unlink; cross-device copies are sha256-verified before the original is removed). Recovery trusts file placement over the journal.
+- Not done: no Playwright spec, because the simulator writes placeholder `organized_to` strings rather than files, and a real-file flow would need a DEBUG seeding endpoint. The flow is covered by HTTP-level backend tests and Vitest component tests.
+- Follow-on (false-positive classification of `TITAN`, the TheDiscDB panel mismatch) is untouched, as specified.

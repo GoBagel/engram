@@ -361,6 +361,16 @@ Separate `uv` project (never imports `backend/`), deployed with Docker from `dep
   is line-oriented and a crafted volume label can otherwise forge a second
   entry. The playlist URL comes from the request `Host`, never `settings.host`.
   Rationale: `docs/superpowers/specs/2026-08-22-review-external-player-design.md`.
+- **Completed movies can be re-identified, journal first (`movie_identity_service.py`).** Files and
+  SQLite cannot change atomically, so a correction is persisted in `movie_identity_operations` BEFORE any
+  file moves (one active operation per job, enforced by a partial unique index), moved with a no-clobber
+  move (`os.link` + unlink, never `os.replace`; cross-device = sha256-verified copy), then committed in
+  one transaction. A failed move or commit rolls back; a rollback that cannot finish is
+  `needs_recovery`, never success. `recover` / startup `reconcile_pending` read where the files really
+  are (not the journal) and never overwrite. Only files tracked by the job, inside the movies library,
+  move; destination names come from `organizer.plan_movie_names`, the one movie-naming definition shared
+  with `organize_movie`. The preview token is a stateless hash, so the POST re-validates instead of
+  trusting a stored preview.
 - **Notification events**: `EVENTS` in `app/core/discord_notifier.py` maps `JobState` to
   presentation. Terminal events arrive via `on_terminal_state`; `REVIEW_NEEDED` arrives via
   `on_transition`, which receives `(job_id, to_state, from_state)` so a same-state
