@@ -23,7 +23,8 @@ This is a guard against accidents. It is not a security boundary: code written t
 | Any `sqlite3.connect` to a file outside a registered directory is refused before the file exists: engines, the backup helper, the TMDB and transcript caches, Alembic helpers, scripts. | Wrapper on `sqlite3.connect` and `sqlite3.dbapi2.connect`. | `TestSqliteConnectGuard`, `TestOpenersThatUsedToBypassTheUrlChecks` |
 | The target is judged the way SQLite reads it: the `uri` flag is honoured, URIs are parsed with SQLite's rules, control characters, repeated parameters and non-local authorities are refused. | `_parse_sqlite_uri`, `_file_from_sqlite_target`. | `TestUriSemantics`, `TestUriParserAgreesWithSqlite` (includes a differential test against real SQLite) |
 | A connector captured before the guard armed, `sqlite3.Connection(...)` and a `creator=` callable are checked too. | `sys.addaudithook` on the `sqlite3.connect` event. | `TestCapturedConnectors`, `TestMarkerCannotBeReusedOrErased` |
-| `ATTACH DATABASE` and `VACUUM INTO` fail on connections opened through the wrapper, including from a factory's own `__init__`. | Attach limit 0, set inside `_GuardedConnection.__init__` through the C method; `setlimit` refuses to raise it. | `TestAttachBanCannotBeUndone`, `TestAttachPinHoldsFromTheFirstInstruction` |
+| The audit hook's "already judged" mark cannot be reused, prefix-matched, erased by a nested call, inherited by a forked child, or faked with a `str` subclass. | The mark is consumed on first use, compared as an exact `str`, restored around nested calls and cleared after `fork`. | `TestMarkerCannotBeReusedOrErased`, `TestJudgedMarkIsAnExactWholeStringMatch` |
+| `ATTACH DATABASE` and `VACUUM INTO` fail on connections opened through the wrapper, including from a cooperative factory's own `__init__` (one that reaches `super().__init__`). | Attach limit 0, set inside `_GuardedConnection.__init__` through the C method; `setlimit` refuses to raise it. | `TestAttachBanCannotBeUndone`, `TestAttachPinHoldsFromTheFirstInstruction` |
 | The guard refuses to arm if the attach ban cannot be enforced on this Python/SQLite. | `_attached_limit_category`. | `test_it_fails_closed_when_the_ban_cannot_be_enforced` |
 | `pytest --cov` (CI) keeps working. | Coverage's own `.coverage` / `.coverage.*` files are exempt from the location rule and the attach pin. | `TestCoverageDataFiles` (includes a real nested `pytest --cov` run) |
 | Nothing is patched, and no audit hook is added, in a process that never imports pytest. | Everything is gated on `"pytest" in sys.modules`. | `test_guard_and_wrapper_are_inert_in_a_process_that_never_imported_pytest` |
@@ -40,10 +41,17 @@ These are known and deliberate. Do not rely on the guard for anything in this li
 - **The attach pin can be undone on purpose.** Calling the base method directly,
   `sqlite3.Connection.setlimit(conn, sqlite3.SQLITE_LIMIT_ATTACHED, 10)`, raises the limit; so does
   ctypes or a patched `sqlite3`.
+- **Factories that do not cooperate.** A factory class that calls `sqlite3.Connection.__init__`
+  directly instead of `super().__init__`, or a plain callable factory, can run `ATTACH` in its own
+  body before the pin is applied. The pin is applied as soon as it returns.
 - **Paths, not file identity.** A path is resolved and then opened later, so a symlink swapped in
-  between is not detected. A hard link to a real database placed inside an allowed directory is
-  accepted. Allowed directories are freshly created, so this needs someone actively working against
-  the guard.
+  between is not detected, and neither is another thread changing the working directory between the
+  check of a relative path and the open. A hard link to a real database placed inside an allowed
+  directory is accepted. Allowed directories are freshly created, so this needs someone actively
+  working against the guard.
+- **The coverage exemption is name-based.** It applies when the name is coverage data both as
+  written and after symlinks are followed, so a link called `.coverage` that points at a database
+  is refused. A real database that someone renames to `.coverage` is not.
 - **Pytest leaving `sys.modules`.** The audit hook cannot be removed. If pytest is removed from
   `sys.modules` the hook and wrapper stop checking; already-created guarded connections keep their
   pin.

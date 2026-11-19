@@ -23,10 +23,11 @@ Layers, outermost first:
    URI is parsed the way SQLite parses it (not with ``urllib``, which strips tabs and
    newlines); control characters, repeated parameters and non-local authorities are
    refused. Connections it opens are an instance of a ``Connection`` subclass whose attach
-   limit is set to 0 inside ``__init__`` through the C method (so a caller's factory cannot
-   neutralise it, and an ``ATTACH`` in a factory's ``__init__`` already finds it in force)
-   and whose ``setlimit`` refuses to raise it. ``ATTACH DATABASE`` and ``VACUUM INTO`` then
-   fail. If the ban cannot be enforced on this Python/SQLite it refuses to open anything.
+   limit is set to 0 inside ``__init__`` through the C method (so an overriding ``setlimit``
+   cannot neutralise it, and an ``ATTACH`` in a cooperative factory's ``__init__``, one that
+   reaches ``super().__init__``, already finds it in force) and whose ``setlimit`` refuses to
+   raise it. ``ATTACH DATABASE`` and ``VACUUM INTO`` then fail. If the ban cannot be enforced
+   on this Python/SQLite it refuses to open anything.
 3. A ``sys.addaudithook`` hook on the ``sqlite3.connect`` audit event, which CPython raises
    from below the replaceable module attributes. It covers openers the wrapper never sees:
    a connector captured before the wrapper was installed, ``sqlite3.Connection(...)``
@@ -62,8 +63,17 @@ Known limits, stated rather than hidden:
   or goes around the Python API (ctypes, a patched ``sqlite3``), can undo it. A connection
   whose class a caller built without going through ``sqlite3.connect`` is not covered.
   This guards against accidents, not against code written to defeat it.
+- A factory that calls ``sqlite3.Connection.__init__`` directly (skipping ``super()``), or a
+  plain callable factory, can run ``ATTACH`` in its own body before the pin is applied; the
+  pin is applied as soon as it returns.
 - Reading an existing real database ``mode=ro`` is refused like any other open; there is no
   read-only exception.
+- A relative path is judged against the current directory when the check runs; another thread
+  changing the working directory between the check and the open is not detected (one case of
+  the check-then-open gap above).
+- The coverage exemption applies to a name that is coverage data both as written and after
+  symlinks are followed; it is still name-based, so a real database that someone renames to
+  ``.coverage`` is exempt.
 - Paths are checked by resolving symlinks and ``..`` and then opened later; a symlink
   swapped in between, or a hard link to a real database placed inside a registered
   directory, is not detected. The registered directories are private, freshly created
@@ -198,9 +208,15 @@ _COVERAGE_DATA_FILE = re.compile(r"\.coverage(\..*)?")
 
 
 def _as_str(database) -> str:
+    """The target as an exact ``str`` (never a subclass, whose ``__eq__`` could lie)."""
     if isinstance(database, (bytes, bytearray)):
-        return os.fsdecode(database)
-    return os.fsdecode(os.fspath(database))  # a PathLike may hand back bytes
+        text = os.fsdecode(database)
+    else:
+        text = os.fsdecode(os.fspath(database))  # a PathLike may hand back bytes
+    if type(text) is not str:
+        # str.encode is called on the base class so an override in a subclass is not used.
+        text = str.encode(text, "utf-8", "surrogateescape").decode("utf-8", "surrogateescape")
+    return text
 
 
 def _percent_decode(text: str) -> str:
@@ -265,7 +281,18 @@ def _file_from_sqlite_target(database, uri: bool) -> str | None:
 
 
 def _is_coverage_data_file(file: str) -> bool:
-    return bool(_COVERAGE_DATA_FILE.fullmatch(os.path.basename(file)))
+    """True if ``file`` is named like coverage data AND still is after following symlinks.
+
+    The resolved name matters: a link called ``.coverage`` that points at a database must
+    not borrow the exemption.
+    """
+    if not _COVERAGE_DATA_FILE.fullmatch(os.path.basename(file)):
+        return False
+    try:
+        resolved = os.path.realpath(file)
+    except (OSError, ValueError):
+        return False
+    return bool(_COVERAGE_DATA_FILE.fullmatch(os.path.basename(resolved)))
 
 
 def check_sqlite_target(database, *, uri: bool = False) -> None:
@@ -437,6 +464,10 @@ def _guarded_connect(database, *args, **kwargs):
 _guarded_connect._engram_guard = True  # type: ignore[attr-defined]
 
 
+def _clear_mark() -> None:
+    _state.judged = None
+
+
 def _audit_hook(event, args):
     if event != "sqlite3.connect" or not args or not running_under_pytest():
         return
@@ -466,5 +497,8 @@ def install_sqlite_guard() -> bool:
             module.connect = _guarded_connect
     if not _hook_installed:
         sys.addaudithook(_audit_hook)
+        if hasattr(os, "register_at_fork"):
+            # A forked child must not inherit the parent's "this call was judged" mark.
+            os.register_at_fork(after_in_child=_clear_mark)
         _hook_installed = True
     return True

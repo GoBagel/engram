@@ -57,6 +57,9 @@ COVERAGE_LOOKALIKES = (".coveragerc", "coverage.sqlite", "x.coverage", ".coverag
 def _remove_canaries():
     CANARY.unlink(missing_ok=True)
     COVERAGE_CANARY.unlink(missing_ok=True)
+    (BACKEND / ".coverage.isolation-link").unlink(missing_ok=True)
+    for stray in BACKEND.glob("file:*"):  # a literal file named like a URI, made by a broken guard
+        stray.unlink()
     for (
         name
     ) in COVERAGE_LOOKALIKES:  # a broken guard could create these; .coveragerc changes coverage
@@ -70,7 +73,7 @@ def _canary_guard():
     """Any test that leaves the canary behind has let something open an unregistered file."""
     _remove_canaries()
     yield
-    existed = CANARY.exists() or any((BACKEND / name).exists() for name in STRAY_FILES[:1])
+    existed = CANARY.exists() or any(BACKEND.glob("file:*"))
     _remove_canaries()
     assert not existed, "a database was created outside the registered test directories"
 
@@ -747,6 +750,42 @@ class TestAttachPinHoldsFromTheFirstInstruction:
         finally:
             conn.close()
 
+    def test_an_overriding_setlimit_and_an_attach_in_init_together_are_still_blocked(
+        self, tmp_path
+    ):
+        """Only the base-method pin inside __init__ stops this: the override swallows every call."""
+
+        class IgnoreAndAttach(sqlite3.Connection):
+            def setlimit(self, category, limit):
+                return self.getlimit(category)
+
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.execute("ATTACH DATABASE ? AS extra", (str(tmp_path / "both.db"),))
+
+        with pytest.raises(sqlite3.Error, match="attached"):
+            sqlite3.connect(":memory:", factory=IgnoreAndAttach)
+        assert not (tmp_path / "both.db").exists()
+
+    def test_a_factory_that_skips_super_init_is_pinned_once_it_returns(self):
+        class SkipsSuper(sqlite3.Connection):
+            def __init__(self, *a, **k):
+                sqlite3.Connection.__init__(self, *a, **k)  # not cooperative: no _GuardedConnection
+
+        conn = sqlite3.connect(":memory:", factory=SkipsSuper)
+        try:
+            assert conn.getlimit(sqlite3.SQLITE_LIMIT_ATTACHED) == 0
+        finally:
+            conn.close()
+
+    def test_the_guarded_subclass_for_a_factory_is_built_once(self):
+        class Reused(sqlite3.Connection):
+            pass
+
+        assert db_guard._guarded_class(Reused) is db_guard._guarded_class(Reused)
+        assert issubclass(db_guard._guarded_class(Reused), Reused)
+        assert db_guard._guarded_class(sqlite3.Connection) is db_guard._GuardedConnection
+
     def test_a_plain_callable_factory_works_and_is_pinned(self):
         conn = sqlite3.connect(":memory:", factory=lambda *a, **k: sqlite3.Connection(*a, **k))
         try:
@@ -810,6 +849,163 @@ class TestCoverageDataFiles:
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert re.search(r"\b1 passed\b", proc.stdout)
         assert "INTERNALERROR" not in proc.stdout + proc.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Gaps found by an independent review (mutants that survived, and real holes)
+# --------------------------------------------------------------------------- #
+
+
+class TestQueryParametersAreReadLikeSqlite:
+    @pytest.mark.parametrize("query", ["MODE=memory", "Mode=memory", "mode=MEMORY", "mode=Memory"])
+    def test_keys_and_values_are_case_sensitive(self, query):
+        """SQLite only knows ``mode=memory``; ``MODE=memory`` opens a disk file."""
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(f"file:{CANARY}?{query}", uri=True)
+        assert not CANARY.exists()
+
+    def test_a_semicolon_is_not_a_separator(self, tmp_path):
+        """SQLite reads ``x=1;mode=memory`` as one parameter named ``x``, so the file is real."""
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(f"file:{CANARY}?x=1;mode=memory", uri=True)
+        assert not CANARY.exists()
+        # And ``mode=memory;mode=rw`` is one unknown mode value, not a repeated key: for a
+        # registered file the guard lets SQLite report that itself instead of refusing.
+        with pytest.raises(sqlite3.OperationalError, match="no such access mode"):
+            sqlite3.connect(f"file:{tmp_path / 'semi.db'}?mode=memory;mode=rw", uri=True)
+
+    def test_a_trailing_slash_is_not_in_memory(self):
+        for target in (f"file:{CANARY}/", f"file:{CANARY}/?mode=rwc"):
+            with pytest.raises(ProductionDatabaseAccessError):
+                sqlite3.connect(target, uri=True)
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(f"{CANARY}/")
+        assert not CANARY.exists()
+
+    @pytest.mark.parametrize("uri", ["file::memory:?mode=rwc", "file:?mode=rw", "file:?mode=ro"])
+    def test_an_empty_path_with_a_file_mode_is_refused_as_ambiguous(self, uri):
+        with pytest.raises(ValueError, match="ambiguous"):
+            db_guard._file_from_sqlite_target(uri, True)
+
+
+class TestConnectionCheckInspectsAttachments:
+    def test_an_in_memory_main_does_not_hide_an_attached_file(self):
+        with pytest.raises(ProductionDatabaseAccessError):
+            enforce_connection_isolation(_StubConn(("main", ""), ("other", str(CANARY))))
+        assert not CANARY.exists()
+
+
+class TestPinFailuresAreLoud:
+    def test_a_pin_that_cannot_be_applied_raises(self, monkeypatch):
+        conn = sqlite3.connect(":memory:")
+        try:
+
+            def broken():
+                raise ProductionDatabaseAccessError("cannot enforce")
+
+            monkeypatch.setattr(db_guard, "_attached_limit_category", broken)
+            with pytest.raises(ProductionDatabaseAccessError):
+                db_guard._pin_attach_limit(conn)
+        finally:
+            conn.close()
+
+
+class TestJudgedMarkIsAnExactWholeStringMatch:
+    def test_a_longer_text_does_not_ride_on_a_shorter_approval(self, monkeypatch):
+        monkeypatch.chdir(
+            BACKEND
+        )  # unregistered: a literal file named like the text would land here
+        original = db_guard._REAL_CONNECT
+        judged_text = "file:marker.sqlite?mode=memory"
+        outcome = []
+
+        class Longer(sqlite3.Connection):
+            def __init__(self, *a, **k):
+                # Before super().__init__ the mark is still set, so this is where a loose
+                # comparison (a prefix, say) would wave the longer text through.
+                try:
+                    original(judged_text + "-longer", uri=False).close()
+                    outcome.append("opened")
+                except ProductionDatabaseAccessError:
+                    outcome.append("refused")
+                super().__init__(*a, **k)
+
+        sqlite3.connect(judged_text, uri=True, factory=Longer).close()
+        assert outcome == ["refused"]
+
+    def test_a_str_subclass_with_a_lying_eq_cannot_approve_everything(self, tmp_path):
+        class Liar(str):
+            __hash__ = str.__hash__
+
+            def __eq__(self, other):
+                return True
+
+        seen = {}
+
+        class Probe(sqlite3.Connection):
+            def __init__(self, *a, **k):
+                seen["type"] = type(getattr(db_guard._state, "judged", None))
+                try:
+                    db_guard._REAL_CONNECT(
+                        str(CANARY)
+                    ).close()  # a captured connector, unregistered
+                    seen["nested"] = "opened"
+                except ProductionDatabaseAccessError:
+                    seen["nested"] = "refused"
+                super().__init__(*a, **k)
+
+        sqlite3.connect(Liar(":memory:"), factory=Probe).close()
+        assert seen == {"type": str, "nested": "refused"}
+        assert db_guard._as_str(Liar("x")).__class__ is str
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+    @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+    def test_a_forked_child_does_not_inherit_the_mark(self, monkeypatch):
+        monkeypatch.chdir(BACKEND)
+        original = db_guard._REAL_CONNECT
+        text = "file:marker.sqlite?mode=memory"
+        result = {}
+
+        class Forker(sqlite3.Connection):
+            def __init__(self, *a, **k):
+                read_fd, write_fd = os.pipe()
+                pid = os.fork()
+                if pid == 0:  # child: the mark set by the parent's wrapper must be gone
+                    os.close(read_fd)
+                    try:
+                        original(text, uri=False).close()
+                        os.write(write_fd, b"opened")
+                    except ProductionDatabaseAccessError:
+                        os.write(write_fd, b"refused")
+                    finally:
+                        os._exit(0)
+                os.close(write_fd)
+                result["child"] = os.read(read_fd, 20).decode()
+                os.close(read_fd)
+                os.waitpid(pid, 0)
+                super().__init__(*a, **k)
+
+        sqlite3.connect(text, uri=True, factory=Forker).close()
+        assert result["child"] == "refused"
+        assert not (BACKEND / f"{text}").exists()
+
+
+class TestCoverageExemptionFollowsSymlinks:
+    def test_a_link_named_like_coverage_data_does_not_borrow_the_exemption(self):
+        link = BACKEND / ".coverage.isolation-link"
+        link.unlink(missing_ok=True)
+        os.symlink(CANARY, link)  # a dangling link to a database outside the roots
+        try:
+            with pytest.raises(ProductionDatabaseAccessError):
+                sqlite3.connect(link)
+            assert not CANARY.exists()
+        finally:
+            link.unlink(missing_ok=True)
+
+    def test_the_resolved_name_must_also_be_coverage_data(self, tmp_path):
+        genuine = BACKEND / ".coverage.isolation-canary"
+        assert db_guard._is_coverage_data_file(str(genuine))
+        assert not db_guard._is_coverage_data_file(str(BACKEND / "engram.db"))
 
 
 # --------------------------------------------------------------------------- #
@@ -1040,7 +1236,12 @@ def test_guard_and_wrapper_are_inert_in_a_process_that_never_imported_pytest(scr
             "assert not getattr(sqlite3.connect, '_engram_guard', False), 'sqlite3 was wrapped'\n"
             "assert not getattr(sqlite3.dbapi2.connect, '_engram_guard', False)\n"
             "import app.db_guard as g\n"
+            "registered = []\n"
+            "real_add = sys.addaudithook\n"
+            "sys.addaudithook = registered.append\n"
             "assert g.install_sqlite_guard() is False  # explicit arming is a no-op too\n"
+            "sys.addaudithook = real_add\n"
+            "assert not registered, 'an audit hook was registered without pytest'\n"
             "assert not getattr(sqlite3.connect, '_engram_guard', False)\n"
             # Unrestricted behaviour: any path opens, ATTACH works, the limit is adjustable.
             "conn = sqlite3.connect('plain.db'); conn.execute('create table t (x)')\n"
