@@ -10,9 +10,11 @@ from app.models.disc_job import (
     TitleState,
 )
 from app.models.fingerprint import DiscContribution, FingerprintContribution
+from app.models.movie_identity_operation import MovieIdentityOperation
 from app.models.show_ordering import ShowOrderingPreference
 
 __all__ = [
+    "MovieIdentityOperation",
     "DiscJob",
     "DiscTitle",
     "JobState",
