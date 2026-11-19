@@ -683,6 +683,48 @@ def organize_movie_extras(
     return {"success": True, "extras_dir": extras_dir, "moved": moved, "error": None}
 
 
+def plan_movie_names(
+    cfg,
+    clean_name: str,
+    year: int | None,
+    tmdb_id: str | int | None,
+    edition: str | None,
+    suffix: str,
+) -> tuple[str, str]:
+    """The library ``(folder_name, file_name)`` for a movie's main feature.
+
+    The single definition of movie naming: ``organize_movie`` files a fresh rip
+    with it and the completed-job correction (``movie_identity_service``) plans
+    its moves with it, so the two can never disagree about where a movie lives.
+    ``clean_name`` must already be final (cleaned, or canonical TMDB); ``suffix``
+    is the container extension including the dot.
+    """
+    # Load naming formats from config
+    folder_name = format_movie_folder(cfg.naming_movie_format, clean_name, year, tmdb_id)
+    # A blank filename format (the default) means "reuse the folder format", which
+    # is exactly the pre-#576 behavior: the folder name was used verbatim as the
+    # filename. Inheriting rather than hardcoding a shape keeps a customized folder
+    # format propagating to the file instead of the two silently disagreeing.
+    file_fmt = (getattr(cfg, "naming_movie_file_format", "") or "").strip()
+    if not file_fmt:
+        # Inherit the folder format. Fall back to the bare title when that is
+        # itself blank, so a cleared folder format cannot leave the filename with
+        # nothing but an edition tag ("{edition-Final Cut}.mkv").
+        file_fmt = (cfg.naming_movie_format or "").strip() or "{title}"
+        # Plex reads the edition tag off the FILE, so an inherited format still
+        # earns the tag when there is an edition. Appended only when one exists,
+        # so a no-edition movie stays byte-identical to its folder name.
+        if edition:
+            file_fmt = file_fmt + " {{edition-{edition}}}"
+    file_stem = format_movie_filename(file_fmt, clean_name, year, tmdb_id, edition)
+    # `format_movie_filename` has no blank-format guard of its own because blank
+    # means "inherit", which is resolved above. But the INHERITED format can itself
+    # be blank (a user who cleared naming_movie_format), which would otherwise file
+    # the movie as a bare ".mkv". Fall back to the folder name, which has its own
+    # guard and degrades to the bare title.
+    return folder_name, f"{file_stem or folder_name}{suffix}"
+
+
 def organize_movie(
     staging_dir: Path,
     movie_name: str,
@@ -758,31 +800,9 @@ def organize_movie(
     # corrupt a TMDB title (Spider-Man -> Spider Man, Se7en -> Se7En).
     clean_name = movie_name if already_clean else clean_movie_name(movie_name)
 
-    # Load naming formats from config
-    cfg = get_config_sync()
-    folder_name = format_movie_folder(cfg.naming_movie_format, clean_name, year, tmdb_id)
-    # A blank filename format (the default) means "reuse the folder format", which
-    # is exactly the pre-#576 behavior: the folder name was used verbatim as the
-    # filename. Inheriting rather than hardcoding a shape keeps a customized folder
-    # format propagating to the file instead of the two silently disagreeing.
-    file_fmt = (getattr(cfg, "naming_movie_file_format", "") or "").strip()
-    if not file_fmt:
-        # Inherit the folder format. Fall back to the bare title when that is
-        # itself blank, so a cleared folder format cannot leave the filename with
-        # nothing but an edition tag ("{edition-Final Cut}.mkv").
-        file_fmt = (cfg.naming_movie_format or "").strip() or "{title}"
-        # Plex reads the edition tag off the FILE, so an inherited format still
-        # earns the tag when there is an edition. Appended only when one exists,
-        # so a no-edition movie stays byte-identical to its folder name.
-        if edition:
-            file_fmt = file_fmt + " {{edition-{edition}}}"
-    file_stem = format_movie_filename(file_fmt, clean_name, year, tmdb_id, edition)
-    # `format_movie_filename` has no blank-format guard of its own because blank
-    # means "inherit", which is resolved above. But the INHERITED format can itself
-    # be blank (a user who cleared naming_movie_format), which would otherwise file
-    # the movie as a bare ".mkv". Fall back to the folder name, which has its own
-    # guard and degrades to the bare title.
-    file_name = f"{file_stem or folder_name}{library_suffix(main_file)}"
+    folder_name, file_name = plan_movie_names(
+        get_config_sync(), clean_name, year, tmdb_id, edition, library_suffix(main_file)
+    )
 
     # Create destination directory
     dest_dir = library_path / folder_name
