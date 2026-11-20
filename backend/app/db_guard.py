@@ -73,7 +73,14 @@ Known limits, stated rather than hidden:
   the check-then-open gap above).
 - The coverage exemption applies to a name that is coverage data both as written and after
   symlinks are followed; it is still name-based, so a real database that someone renames to
-  ``.coverage`` is exempt.
+  ``.coverage``, a link to another coverage-named file outside the roots, and a hard link
+  named ``.coverage.<suffix>`` to any database are all exempt.
+- The target is read once for the check and SQLite reads the object again for the open, so a
+  stateful ``__fspath__`` that answers differently the second time is not detected. ``str`` and
+  ``bytes`` subclasses that override ``__eq__``/``encode``/``decode`` are defeated: conversion
+  goes through the base-class methods.
+- The after-fork handler covers ``os.fork``. Reloading this module registers a second audit hook
+  and a second handler, which repeat the same work.
 - Paths are checked by resolving symlinks and ``..`` and then opened later; a symlink
   swapped in between, or a hard link to a real database placed inside a registered
   directory, is not detected. The registered directories are private, freshly created
@@ -208,15 +215,20 @@ _COVERAGE_DATA_FILE = re.compile(r"\.coverage(\..*)?")
 
 
 def _as_str(database) -> str:
-    """The target as an exact ``str`` (never a subclass, whose ``__eq__`` could lie)."""
-    if isinstance(database, (bytes, bytearray)):
-        text = os.fsdecode(database)
-    else:
-        text = os.fsdecode(os.fspath(database))  # a PathLike may hand back bytes
-    if type(text) is not str:
-        # str.encode is called on the base class so an override in a subclass is not used.
-        text = str.encode(text, "utf-8", "surrogateescape").decode("utf-8", "surrogateescape")
-    return text
+    """The target as an exact ``str``, read through the base classes only.
+
+    A ``str`` or ``bytes`` subclass can override ``__eq__``, ``encode`` or ``decode`` and report
+    one text to the guard while SQLite opens another, so every conversion here calls the base
+    class method directly instead of ``os.fsdecode`` (which calls ``bytes.decode`` on the object).
+    """
+    value = database if isinstance(database, (bytes, bytearray)) else os.fspath(database)
+    if isinstance(value, bytes):  # includes subclasses
+        return bytes.decode(value, sys.getfilesystemencoding(), "surrogateescape")
+    if isinstance(value, bytearray):
+        return bytearray.decode(value, sys.getfilesystemencoding(), "surrogateescape")
+    if type(value) is not str:
+        return str.encode(value, "utf-8", "surrogateescape").decode("utf-8", "surrogateescape")
+    return value
 
 
 def _percent_decode(text: str) -> str:

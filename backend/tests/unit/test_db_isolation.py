@@ -1009,6 +1009,102 @@ class TestCoverageExemptionFollowsSymlinks:
 
 
 # --------------------------------------------------------------------------- #
+# Findings from a Claude subagent review: subclass lies, exemption details
+# --------------------------------------------------------------------------- #
+
+
+class TestTargetsAreReadThroughBaseClasses:
+    """``str`` and ``bytes`` subclasses can override the methods the guard converts with."""
+
+    def test_a_bytes_subclass_with_a_lying_decode_cannot_hide_its_path(self):
+        class LyingBytes(bytes):
+            def decode(self, *args, **kwargs):
+                return ":memory:"
+
+        class ViaPathLike:
+            def __fspath__(self):
+                return LyingBytes(os.fsencode(CANARY))
+
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(LyingBytes(os.fsencode(CANARY)))
+        with pytest.raises(ProductionDatabaseAccessError):
+            sqlite3.connect(ViaPathLike())
+        assert not CANARY.exists()
+        assert db_guard._as_str(LyingBytes(b"/x/y.db")) == "/x/y.db"
+
+    def test_a_bytearray_subclass_is_read_through_the_base_class_too(self):
+        class LyingByteArray(bytearray):
+            def decode(self, *args, **kwargs):
+                return ":memory:"
+
+            def __bytes__(self):
+                return b":memory:"
+
+        assert db_guard._as_str(LyingByteArray(b"/x/y.db")) == "/x/y.db"
+
+    def test_conversions_are_exact_and_lossless_for_ordinary_input(self):
+        assert db_guard._as_str(b"/x/y.db") == "/x/y.db"
+        assert db_guard._as_str(bytearray(b"/x/z.db")) == "/x/z.db"
+        assert db_guard._as_str("/a b/ü.db") == "/a b/ü.db"
+        assert db_guard._as_str(Path("/x/p.db")) == "/x/p.db"
+        assert type(db_guard._as_str(bytearray(b"/x"))) is str
+
+    def test_undecodable_bytes_survive_as_surrogate_escapes(self):
+        """Strict decoding would raise here and refuse a path SQLite can open."""
+        assert db_guard._as_str(b"/x/\xff.db") == "/x/\udcff.db"
+
+        class Escaped(str):
+            pass
+
+        assert db_guard._as_str(Escaped("/x/\udcff.db")) == "/x/\udcff.db"
+        assert type(db_guard._as_str(Escaped("/x/\udcff.db"))) is str
+
+    def test_a_lone_surrogate_that_cannot_be_escaped_is_an_error_not_a_pass(self):
+        class Bad(str):
+            pass
+
+        with pytest.raises(ValueError):
+            db_guard._as_str(Bad("/x/\ud800.db"))
+
+    def test_an_error_from_the_target_object_is_not_swallowed_into_in_memory(self):
+        class Raises:
+            def __fspath__(self):
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError):
+            db_guard._as_str(Raises())
+        with pytest.raises(RuntimeError):
+            sqlite3.connect(Raises())
+
+
+class TestCoverageExemptionDetails:
+    def test_the_written_name_must_be_coverage_data_too(self, tmp_path):
+        """A link called x.db that resolves to coverage data is not exempt by its resolved name."""
+        genuine = tmp_path / ".coverage.y"
+        genuine.write_bytes(b"")
+        link = tmp_path / "x.db"
+        os.symlink(genuine, link)
+        assert db_guard._is_coverage_data_file(str(genuine))
+        assert not db_guard._is_coverage_data_file(str(link))
+
+    def test_a_failure_to_resolve_is_not_an_exemption(self, monkeypatch):
+        def broken(_path):
+            raise OSError("cannot resolve")
+
+        monkeypatch.setattr(db_guard.os.path, "realpath", broken)
+        assert not db_guard._is_coverage_data_file("/anywhere/.coverage.q")
+
+    def test_the_exemption_follows_the_path_inside_a_uri(self, tmp_path):
+        """Judged on the path the URI names, not on the URI text (``.coverage?mode=rwc``)."""
+        conn = sqlite3.connect(f"file:{tmp_path / '.coverage'}?mode=rwc", uri=True)
+        try:
+            conn.execute("ATTACH DATABASE ? AS other", (str(tmp_path / ".coverage.other"),))
+        finally:
+            conn.close()
+        assert (tmp_path / ".coverage.other").exists()  # an exempt connection is not ATTACH-pinned
+
+
+# --------------------------------------------------------------------------- #
 # Connection-level check (second opinion behind the wrapper)
 # --------------------------------------------------------------------------- #
 
@@ -1231,17 +1327,24 @@ def test_guard_and_wrapper_are_inert_in_a_process_that_never_imported_pytest(scr
     proc = _run(
         [
             "-c",
-            "import sys, sqlite3; assert 'pytest' not in sys.modules\n"
+            "import os, sys, sqlite3; assert 'pytest' not in sys.modules\n"
+            # Record every audit-hook and at-fork registration from BEFORE the app is imported,
+            # so a registration at import time is seen as well as one in install_sqlite_guard().
+            "registered = []\n"
+            "real_add, real_fork = sys.addaudithook, os.register_at_fork\n"
+            "sys.addaudithook = lambda hook: registered.append(('audit hook', hook))\n"
+            "os.register_at_fork = lambda **handlers: registered.append(('at-fork', handlers))\n"
             "import app.config as c, app.database\n"
             "assert not getattr(sqlite3.connect, '_engram_guard', False), 'sqlite3 was wrapped'\n"
             "assert not getattr(sqlite3.dbapi2.connect, '_engram_guard', False)\n"
             "import app.db_guard as g\n"
-            "registered = []\n"
-            "real_add = sys.addaudithook\n"
-            "sys.addaudithook = registered.append\n"
             "assert g.install_sqlite_guard() is False  # explicit arming is a no-op too\n"
-            "sys.addaudithook = real_add\n"
-            "assert not registered, 'an audit hook was registered without pytest'\n"
+            "sys.addaudithook, os.register_at_fork = real_add, real_fork\n"
+            # Other modules (logging, ...) register their own at-fork handlers on import; only
+            # the guard's hook and handler matter here.
+            "ours = [kind for kind, what in registered if what is g._audit_hook\n"
+            "        or (isinstance(what, dict) and g._clear_mark in what.values())]\n"
+            "assert not ours, f'the guard registered {ours} without pytest'\n"
             "assert not getattr(sqlite3.connect, '_engram_guard', False)\n"
             # Unrestricted behaviour: any path opens, ATTACH works, the limit is adjustable.
             "conn = sqlite3.connect('plain.db'); conn.execute('create table t (x)')\n"

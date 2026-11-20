@@ -23,11 +23,11 @@ This is a guard against accidents. It is not a security boundary: code written t
 | Any `sqlite3.connect` to a file outside a registered directory is refused before the file exists: engines, the backup helper, the TMDB and transcript caches, Alembic helpers, scripts. | Wrapper on `sqlite3.connect` and `sqlite3.dbapi2.connect`. | `TestSqliteConnectGuard`, `TestOpenersThatUsedToBypassTheUrlChecks` |
 | The target is judged the way SQLite reads it: the `uri` flag is honoured, URIs are parsed with SQLite's rules, control characters, repeated parameters and non-local authorities are refused. | `_parse_sqlite_uri`, `_file_from_sqlite_target`. | `TestUriSemantics`, `TestUriParserAgreesWithSqlite` (includes a differential test against real SQLite) |
 | A connector captured before the guard armed, `sqlite3.Connection(...)` and a `creator=` callable are checked too. | `sys.addaudithook` on the `sqlite3.connect` event. | `TestCapturedConnectors`, `TestMarkerCannotBeReusedOrErased` |
-| The audit hook's "already judged" mark cannot be reused, prefix-matched, erased by a nested call, inherited by a forked child, or faked with a `str` subclass. | The mark is consumed on first use, compared as an exact `str`, restored around nested calls and cleared after `fork`. | `TestMarkerCannotBeReusedOrErased`, `TestJudgedMarkIsAnExactWholeStringMatch` |
+| The audit hook's "already judged" mark cannot be reused, prefix-matched, erased by a nested call, inherited by a forked child, or faked with a `str` or `bytes` subclass whose methods lie. | The mark is consumed on first use, compared as an exact `str` (targets are converted through the base-class methods only), restored around nested calls and cleared after `fork`. | `TestMarkerCannotBeReusedOrErased`, `TestJudgedMarkIsAnExactWholeStringMatch`, `TestTargetsAreReadThroughBaseClasses` |
 | `ATTACH DATABASE` and `VACUUM INTO` fail on connections opened through the wrapper, including from a cooperative factory's own `__init__` (one that reaches `super().__init__`). | Attach limit 0, set inside `_GuardedConnection.__init__` through the C method; `setlimit` refuses to raise it. | `TestAttachBanCannotBeUndone`, `TestAttachPinHoldsFromTheFirstInstruction` |
 | The guard refuses to arm if the attach ban cannot be enforced on this Python/SQLite. | `_attached_limit_category`. | `test_it_fails_closed_when_the_ban_cannot_be_enforced` |
 | `pytest --cov` (CI) keeps working. | Coverage's own `.coverage` / `.coverage.*` files are exempt from the location rule and the attach pin. | `TestCoverageDataFiles` (includes a real nested `pytest --cov` run) |
-| Nothing is patched, and no audit hook is added, in a process that never imports pytest. | Everything is gated on `"pytest" in sys.modules`. | `test_guard_and_wrapper_are_inert_in_a_process_that_never_imported_pytest` |
+| Nothing is patched, and no audit hook or at-fork handler is registered, in a process that never imports pytest. | Everything is gated on `"pytest" in sys.modules`. | `test_guard_and_wrapper_are_inert_in_a_process_that_never_imported_pytest` (records registrations from before the app is imported) |
 
 ### Limits
 
@@ -51,7 +51,19 @@ These are known and deliberate. Do not rely on the guard for anything in this li
   working against the guard.
 - **The coverage exemption is name-based.** It applies when the name is coverage data both as
   written and after symlinks are followed, so a link called `.coverage` that points at a database
-  is refused. A real database that someone renames to `.coverage` is not.
+  is refused. It is still only a name: a real database that someone renames to `.coverage` is
+  exempt, a link named `.coverage` that points at another coverage-named file outside the allowed
+  directories is allowed, a `..` component in the path is followed, and a hard link named
+  `.coverage.<suffix>` to any database is exempt.
+- **Objects that report different targets each time they are asked.** The guard reads the target
+  once and SQLite reads the object again itself, so a stateful `__fspath__` that answers safely
+  for the check and unsafely for the open is not detected. `str` and `bytes` subclasses that
+  override `__eq__`, `encode` or `decode` are defeated, because conversion goes through the base
+  classes.
+- **Fork and reload.** The after-fork handler covers `os.fork` (including from a thread); a
+  `subprocess` child execs a new interpreter, which arms its own guard if it runs pytest.
+  Reloading `app.db_guard` resets its own bookkeeping and registers a second audit hook and a
+  second at-fork handler, which do the same work twice.
 - **Pytest leaving `sys.modules`.** The audit hook cannot be removed. If pytest is removed from
   `sys.modules` the hook and wrapper stop checking; already-created guarded connections keep their
   pin.
