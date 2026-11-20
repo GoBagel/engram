@@ -9,6 +9,7 @@ Engram is a disc ripping and media organization tool with a reactive web dashboa
 ## Important Rules
 
 - **NEVER delete `backend/engram.db`** unless the user explicitly asks. It contains API keys and credentials that must be re-entered manually.
+- **Tests must never touch a real database.** `uv run pytest` from `backend/` used to open `backend/engram.db` (the default `./engram.db` is cwd-relative) and, via the integration suite, replace a configured `app_config` row with fixture rows and delete job history. `tests/conftest.py` now forces `DATABASE_URL` to a throwaway file in a fresh directory *before* the app is imported and registers that directory (plus pytest's basetemp) as the only place a test may keep SQLite files. `app/db_guard.py` fails closed (raises `ProductionDatabaseAccessError`) while `pytest` is imported: it checks the configured URL, wraps `sqlite3.connect` (targets are judged with SQLite's own URI rules), adds an audit hook that also checks captured connectors, `sqlite3.Connection(...)` and `creator=` callables, and gives wrapped connections an attach limit of 0 so `ATTACH` and `VACUUM INTO` fail. The system temp dir as a whole is deliberately not trusted; coverage.py's own `.coverage*` files are exempt (CI runs `pytest --cov`). It guards against accidents, not against code written to defeat it, and its limits are listed in `docs/development/db-isolation.md`. Never add a fixture, env override, or `settings.database_url` patch that points at `./engram.db`, `~/.engram/`, or any real path; never weaken `tests/conftest.py` or the guard to make a test pass. Regression tests: `backend/tests/unit/test_db_isolation.py`.
 - **Always terminate this session's servers when work is done — and before opening a PR.** Kill the `uvicorn`/`python` (uvicorn workers) and `makemkvcon` processes you started; orphans cause duplicate jobs and MakeMKV drive conflicts. If you're the only running session, killing them all is fine; if other sessions are live, scope the kill to **your own ports** so you don't take down a sibling (see "Parallel sessions / worktree isolation"). Never use `--reload` — it spawns a child process with its own drive sentinel, creating duplicate disc events.
 
 ## Repository Organization
@@ -582,7 +583,7 @@ async def client():
 
 @pytest.fixture(autouse=True)
 async def setup_db():
-    """Clean database between tests."""
+    """Clean the TEST database between tests (never a real one, see below)."""
     await init_db()
     async with async_session() as session:
         await session.execute(text("DELETE FROM disc_titles"))
@@ -590,8 +591,26 @@ async def setup_db():
         await session.commit()
 ```
 
+**Database isolation (read before writing any test that touches the DB)**:
+- That pattern is only safe because `tests/conftest.py` points `DATABASE_URL` at a throwaway
+  file in a directory it created, and registers that directory, before `app` is imported, so the
+  app's "real" `async_session` is the test database. In a different process or rootdir (no
+  `tests/conftest.py`), the same code would run `DELETE` against whatever `DATABASE_URL` resolves
+  to, so `app/db_guard.py` refuses to start under pytest, and refuses any `sqlite3.connect`,
+  unless the target is in-memory or inside a registered test directory.
+- Every `DELETE FROM app_config` / `drop_all` / `DELETE FROM disc_jobs` in a test is fine
+  only for that reason. Do not copy it into a script, a one-off harness, or a pytest run
+  started from a custom rootdir. A script that needs a database sets its own scratch
+  `DATABASE_URL` (see `docs/development/subtitle-cache.md`).
+- To check isolation before the first run, without running any test, from `backend/`:
+  `DATABASE_URL=sqlite+aiosqlite:///./engram.db uv run python -c "import pytest, app.config"`
+  must fail with `ProductionDatabaseAccessError` (it opens nothing: the refusal is at import).
+  `uv run pytest tests/unit/test_db_isolation.py` then runs only the isolation tests. In a checkout
+  whose `backend/engram.db` matters, hash it before and after a run and confirm it is unchanged.
+  Full procedure, guarantees, limits and troubleshooting: `docs/development/db-isolation.md`.
+
 **Key patterns**:
-- Use real `async_session` from app (not mocked)
+- Use the app's `async_session` (it is the isolated test database, see above); unit tests also patch it onto an in-memory engine
 - Clean data between tests with autouse fixture
 - Use simulation endpoints (`POST /api/simulate/insert-disc`)
 - Poll job state with asyncio.sleep() for async workflows

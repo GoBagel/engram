@@ -97,7 +97,9 @@ def _build_sync_engine(sync_db_url: str):
 
     from app.config import settings
     from app.database import set_sqlite_pragma
+    from app.db_guard import enforce_test_database_isolation
 
+    enforce_test_database_isolation(sync_db_url)
     db_path = make_url(sync_db_url).database
     is_memory = not db_path or db_path == ":memory:"
 

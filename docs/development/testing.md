@@ -78,13 +78,35 @@ async def client():
 
 @pytest.fixture(autouse=True)
 async def setup_db():
-    """Clean database between tests."""
+    """Clean the TEST database between tests (see "Database isolation" below)."""
     await init_db()
     async with async_session() as session:
         await session.execute(text("DELETE FROM disc_titles"))
         await session.execute(text("DELETE FROM disc_jobs"))
         await session.commit()
 ```
+
+#### Database isolation
+
+The fixture above runs `DELETE` statements against whatever `DATABASE_URL` resolves to, and the
+default is the working-directory-relative `./engram.db`: your real database when you run pytest
+from `backend/`. Two things make that safe:
+
+1. `tests/conftest.py` sets `DATABASE_URL` to a throwaway file in a directory it creates,
+   unconditionally, before anything imports `app` (an exported `DATABASE_URL` in your shell is
+   overridden too), and registers that directory and pytest's basetemp as the only places a test
+   may keep SQLite files. If a test needs its own SQLite file, use `tmp_path` or `:memory:`.
+2. `app/db_guard.py` fails closed while `pytest` is imported (it does nothing in a served or
+   packaged Engram, which never imports it): it refuses any SQLite file outside those directories
+   with `ProductionDatabaseAccessError` and disables `ATTACH`. coverage.py's own `.coverage*` files
+   are exempt, so `pytest --cov` (CI) keeps working.
+
+If a pytest run aborts with that error, something bypassed `tests/conftest.py`. Fix the test; do not
+loosen the guard. It protects against accidents, not against code written to defeat it.
+
+How it works, what it does and does not guarantee, how to verify isolation before the first run
+and how to troubleshoot a refusal: see [Database isolation under pytest](db-isolation.md). The
+regression tests are in `backend/tests/unit/test_db_isolation.py`.
 
 ### Frontend E2E
 
