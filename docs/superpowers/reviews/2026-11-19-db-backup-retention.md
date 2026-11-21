@@ -64,3 +64,10 @@ this PR): the only clean copy of the user's configuration was an automatic pre-m
 
 Each of 2 to 4 is small enough for its own PR and would need tests in
 `backend/tests/unit/test_database_backup.py`.
+
+## Follow-up status
+
+- **Recommendation 1 (docs): done**, in `docs/troubleshooting.md` (restore steps now say to keep a copy of the backup).
+- **Recommendation 2 (snapshot the config on change): done.** `backend/app/services/config_snapshots.py` writes a settings file (the Settings -> Export format, secrets included) when settings are saved and at startup, keeps the newest 10 beside the database, and restores through the existing Settings -> Import. It reuses `config_transfer.export_from_config`; there is no second format. Tests: `backend/tests/unit/test_config_snapshots.py`.
+- **Recommendation 3 (detect a config regression at startup): not started.** Detection only; the snapshot is what makes recovery possible.
+- **Recommendation 4 (pin a last-known-good backup) and 5 (`BACKUP_KEEP`): not planned.** The snapshot removes the need for the heuristic pin.
