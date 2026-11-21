@@ -133,9 +133,11 @@ If an upgrade leaves Engram unable to start, or your settings look wrong afterwa
 
 1. Stop Engram completely (quit the app, or stop your Engram container, for example `docker compose stop engram`).
 2. In the database folder, move `engram.db` aside, along with `engram.db-wal` and `engram.db-shm` if they exist. Keep them until you're sure the restore worked.
-3. Copy the backup you want (usually the newest) to `engram.db`.
+3. **Copy** the backup you want (usually the newest) to `engram.db`, and also copy it to a safe place outside the database folder, for example your home folder. Copy it rather than renaming it, and see the note below for why.
 4. Delete `engram.db.version` so the next start treats the database as coming from the older version.
 5. Start the version of Engram that made the backup (the version is in its name). Starting a newer version will try the same upgrade again, so if the upgrade itself is the problem, stay on the older version and [report it](getting-help.md) with the startup log.
+
+Keep a copy of the backup you restore from. Only the three newest copies are kept, and Engram makes a new one whenever it has to change the database's layout or you start a newer version. Following the steps above always uses up one of the three: deleting `engram.db.version` makes the next start treat the database as an upgrade, so Engram saves a copy of the database you just restored. After a few more such starts, the file you restored from can be deleted. A copy outside the database folder is never touched by that cleanup.
 
 If a backup can't be written (for example, the disk is full), Engram logs a warning and starts anyway.
 
