@@ -141,6 +141,22 @@ Keep a copy of the backup you restore from. Only the three newest copies are kep
 
 If a backup can't be written (for example, the disk is full), Engram logs a warning and starts anyway.
 
+## Restoring your settings from a snapshot
+
+The database backups above are only made when Engram is about to change the database, so they can't help if your settings are lost at some other time (for example the setup wizard shows up again and your keys are gone). For that, Engram also keeps **settings snapshots**: a copy of the settings you have entered, written each time you save settings that changed, and once when Engram starts. The 10 newest are kept, in a folder next to the database named `engram.db.config-snapshots` (so `~/.engram/engram.db.config-snapshots` for the packaged app). Each file is named `settings-<date and time>-<code>.json`; the newest has the latest date and time.
+
+A snapshot is an ordinary Engram settings file, the same kind **Export settings** writes with keys and passwords included. To restore one:
+
+1. Open Settings and choose **Import settings**. On a fresh start the setup wizard offers the same thing: **Restoring from another install? Import a settings file**. Engram can keep running while you do this.
+2. Pick the newest snapshot (or an earlier one if the newest is the wrong state). Engram shows every setting it would change, so you can check them before applying.
+
+Things worth knowing:
+
+- Snapshots hold your keys and passwords **in plain text**, the same as the database itself. On Linux and macOS the folder and files are readable only by your account. On Windows they rely on your user profile folder. Treat the folder like the database when you share or back up your machine; to remove the snapshots, delete the folder.
+- Engram only writes a snapshot when your settings have something you entered (a key, a password, a local AI server, or a finished setup). A blank configuration is never saved over a good one.
+- Saving the same values twice does not add a snapshot, and a snapshot that can't be written never stops your settings from saving; Engram logs a warning.
+- Settings that belong to one install (for example whether setup is complete and whether other computers on your network may connect) are not part of a settings file, so you set those again.
+
 ## Diagnostics bundle
 
 When reporting a problem, attach a diagnostics bundle so the logs and environment come with it. From the dashboard, open a job's detail view and download its diagnostic `.zip`, or fetch the overall report from `GET /api/diagnostics/report`. Secrets (API keys, tokens) are redacted automatically.

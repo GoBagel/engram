@@ -48,6 +48,12 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialized")
 
+    # A snapshot of the stored settings, so a configuration that existed before this
+    # version had snapshots is covered from the first start (never raises).
+    from app.services.config_snapshots import snapshot_current_config
+
+    await snapshot_current_config(reason="startup")
+
     # Auto-detect tools and populate config
     from app.api.validation import detect_ffmpeg, detect_makemkv
     from app.services.config_service import get_config, update_config

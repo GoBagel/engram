@@ -37,6 +37,7 @@ __all__ = [
     "SettingsFileError",
     "apply_import",
     "build_export",
+    "export_from_config",
     "exportable_fields",
     "parse_settings_file",
     "preview_import",
@@ -114,9 +115,12 @@ def exportable_fields() -> list[str]:
     return [k for k in _config_update_model().model_fields if k not in EXCLUDED_FIELDS]
 
 
-async def build_export(include_secrets: bool) -> dict:
-    """The settings file for the current configuration."""
-    config = await get_config()
+def export_from_config(config, include_secrets: bool) -> dict:
+    """The settings file for ``config``. Pure: no database access, no logging.
+
+    Shared by the user's export and by the automatic settings snapshots, so both write
+    the one format that the Settings import accepts.
+    """
     settings = {}
     for key in exportable_fields():
         if key in SECRET_FIELDS and not include_secrets:
@@ -127,10 +131,6 @@ async def build_export(include_secrets: bool) -> dict:
         if value is None and key not in NULLABLE_FIELDS:
             continue
         settings[key] = value
-    logger.info(
-        f"Exported settings ({len(settings)} keys, keys and passwords included: "
-        f"{'yes' if include_secrets else 'no'})"
-    )
     return {
         "format": FILE_FORMAT,
         "schema_version": SCHEMA_VERSION,
@@ -139,6 +139,16 @@ async def build_export(include_secrets: bool) -> dict:
         "includes_secrets": include_secrets,
         "settings": settings,
     }
+
+
+async def build_export(include_secrets: bool) -> dict:
+    """The settings file for the current configuration."""
+    data = export_from_config(await get_config(), include_secrets)
+    logger.info(
+        f"Exported settings ({len(data['settings'])} keys, keys and passwords included: "
+        f"{'yes' if include_secrets else 'no'})"
+    )
+    return data
 
 
 def parse_settings_file(data: object) -> tuple[dict, list[str]]:

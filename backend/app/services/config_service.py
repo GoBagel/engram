@@ -58,6 +58,13 @@ async def get_config() -> AppConfig:
         return config
 
 
+async def get_config_if_exists() -> AppConfig | None:
+    """The stored configuration, or None. Unlike ``get_config`` it never creates a row."""
+    async with async_session() as session:
+        result = await session.execute(select(AppConfig).limit(1))
+        return result.scalar_one_or_none()
+
+
 _sync_engine = None
 # Guards the lazy build of _sync_engine. get_config_sync() is called from
 # asyncio.to_thread workers, so two threads can both observe `_sync_engine is
@@ -244,6 +251,12 @@ async def update_config(**kwargs) -> AppConfig:
 
         await session.commit()
         await session.refresh(config)
+
+        # Keep a rolling copy of the settings the user has entered, so a lost
+        # configuration can be restored (never raises; see config_snapshots).
+        from app.services.config_snapshots import snapshot_config
+
+        await snapshot_config(config, reason="settings saved")
 
         # Ensure paths exist
         await ensure_paths_exist(config)
